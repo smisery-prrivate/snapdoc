@@ -2,7 +2,7 @@
 /* Snapdoc core: helpers, settings, encrypted storage, the document model, the processing
    queue, screens and the back button. The app is several plain script files that share one
    scope (no build step); index.html loads them in order. */
-const VERSION = 'v10';
+const VERSION = 'v11';
 const $ = id => document.getElementById(id);
 const IMG = self.SnapdocImaging;
 const CFG = self.APP_CONFIG || {};
@@ -15,7 +15,7 @@ const dateStamp = t => { const d = t ? new Date(t) : new Date(); return d.getFul
 const fmtSize = b => b < 1024 ? b + ' B' : b < 1048576 ? (b / 1024).toFixed(0) + ' KB' : (b / 1048576).toFixed(1) + ' MB';
 const fmtDate = t => new Date(t).toLocaleDateString(undefined, { day: 'numeric', month: 'short', year: 'numeric' });
 const utf8 = s => new TextEncoder().encode(s);
-const errText = e => (e && e.message) || String(e);
+const errText = e => (e && (e.message || e.name)) || (e == null ? 'unknown error' : String(e));
 // thumbnails are only ever accepted as a plain base64 image
 const safeThumb = t => typeof t === 'string' && /^data:image\/(jpeg|png|webp);base64,[A-Za-z0-9+/=]+$/.test(t) ? t : '';
 
@@ -53,10 +53,12 @@ const idb = (() => {
     r.onupgradeneeded = () => { const d = r.result; for (const s of STORES) if (!d.objectStoreNames.contains(s)) d.createObjectStore(s, { keyPath: 'id' }); };
     r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error);
   }));
+  const txOpts = (store, mode) => mode === 'readwrite' && store === 'meta' ? { durability: 'strict' } : undefined;      // the key record and the list are on disk before the next step relies on them
+  const fail = (t, e) => t.error || (e && e.target && e.target.error) || new Error('storage request failed');       // a refused request reports its own error before the transaction has one
   const tx = async (store, mode, fn) => {
     if (mode === 'readwrite') writeGuard();
     const d = await open();
-    return new Promise((res, rej) => { const t = d.transaction(store, mode); const rq = fn(t.objectStore(store)); t.oncomplete = () => res(rq && rq.result); t.onerror = () => rej(t.error); t.onabort = () => rej(t.error || new Error('storage write was aborted')); });
+    return new Promise((res, rej) => { const t = d.transaction(store, mode, txOpts(store, mode)); const rq = fn(t.objectStore(store)); t.oncomplete = () => res(rq && rq.result); t.onerror = e => rej(fail(t, e)); t.onabort = e => rej(fail(t, e)); });
   };
   return {
     get: (s, k) => tx(s, 'readonly', o => o.get(k)), put: (s, v) => tx(s, 'readwrite', o => o.put(v)), del: (s, k) => tx(s, 'readwrite', o => o.delete(k)),
@@ -65,9 +67,9 @@ const idb = (() => {
     async cas(s, k, fn) {
       writeGuard(); const d = await open();
       return new Promise((res, rej) => {
-        const t = d.transaction(s, 'readwrite'), o = t.objectStore(s); let did = false;
+        const t = d.transaction(s, 'readwrite', txOpts(s, 'readwrite')), o = t.objectStore(s); let did = false;
         const g = o.get(k); g.onsuccess = () => { const nv = fn(g.result); if (nv) { o.put(nv); did = true; } };
-        t.oncomplete = () => res(did); t.onerror = () => rej(t.error); t.onabort = () => rej(t.error || new Error('storage write was aborted'));
+        t.oncomplete = () => res(did); t.onerror = e => rej(fail(t, e)); t.onabort = e => rej(fail(t, e));
       });
     },
     async wipe() { for (const s of STORES) await tx(s, 'readwrite', o => o.clear()).catch(() => {}); }
@@ -77,16 +79,31 @@ const metaStore = { get: id => idb.get('meta', id), put: rec => idb.put('meta', 
 
 // ---------- encrypted records: nothing readable is written to the device ----------
 const pLabel = (id, part) => 'sd|p|' + id + '|' + part;
-// fields: jpeg / prev / orig (Blob or null) and meta (small object, merged into what is there)
+const sameIv = (a, b) => { if (!a || !b || a.byteLength !== b.byteLength) return false; const x = new Uint8Array(a, 0, 12), y = new Uint8Array(b, 0, 12); return x.every((v, i) => v === y[i]); };
+// Record writes and the key renewal: a write that began under the previous key is sealed and
+// stored once more under the new one, so no record ever lands under a key that is about to go.
+// recWrites counts the writes in flight, recSeq every start and end; the re-encryption pass uses both.
+let recWrites = 0, recSeq = 0;
+// fields: jpeg / prev / orig (Blob or null) and meta (small object, merged into what is there).
+// Only the fields given are replaced, inside one transaction on the record as it is stored then;
+// the meta object is written only if the stored one is still the one that was read and merged.
 async function pagePut(id, docId, fields) {
-  const rec = (await idb.get('pages', id)) || { id, doc: docId };
-  rec.ts = Date.now();
-  for (const k of ['jpeg', 'prev', 'orig']) if (k in fields) rec[k] = fields[k] ? await Vault.sealBlob(fields[k], pLabel(id, k)) : null;
-  if (fields.meta) {
-    const cur = rec.m ? await Vault.openJson(rec.m, pLabel(id, 'm')) : {};
-    rec.m = await Vault.sealJson(Object.assign(cur, fields.meta), pLabel(id, 'm'));
-  }
-  await idb.put('pages', rec);
+  recWrites++; recSeq++;
+  try {
+    for (;;) {
+      const gen = Vault.keyGen(), upd = {};
+      for (const k of ['jpeg', 'prev', 'orig']) if (k in fields) upd[k] = fields[k] ? await Vault.sealBlob(fields[k], pLabel(id, k)) : null;
+      if (fields.meta) {
+        for (;;) {
+          const r = await idb.get('pages', id), was = (r && r.m) || null;
+          const cur = was ? await Vault.openJson(was, pLabel(id, 'm')) : {};
+          const m = await Vault.sealJson(Object.assign(cur, fields.meta), pLabel(id, 'm'));
+          if (await idb.cas('pages', id, c => { const rec = c || { id, doc: docId }; if (was ? !sameIv(rec.m, was) : !!rec.m) return; return Object.assign(rec, upd, { m, ts: Date.now() }); })) break;
+        }
+      } else await idb.cas('pages', id, c => Object.assign(c || { id, doc: docId }, upd, { ts: Date.now() }));
+      if (Vault.keyGen() === gen) return;
+    }
+  } finally { recWrites--; recSeq++; }
 }
 // want: which blobs to decrypt, e.g. ['prev']; the small meta object always comes along
 async function pageGet(id, want) {
@@ -96,7 +113,11 @@ async function pageGet(id, want) {
   for (const k of want || []) out[k] = rec[k] ? await Vault.openBlob(rec[k], pLabel(id, k), 'image/jpeg') : null;
   return out;
 }
-async function pdfPut(id, sig, blob) { await idb.put('pdfs', { id, s: await Vault.seal(utf8(sig), 'sd|pdf|' + id + '|s'), data: await Vault.sealBlob(blob, 'sd|pdf|' + id) }); }
+async function pdfPut(id, sig, blob) {
+  recWrites++; recSeq++;
+  try { let gen; do { gen = Vault.keyGen(); await idb.put('pdfs', { id, s: await Vault.seal(utf8(sig), 'sd|pdf|' + id + '|s'), data: await Vault.sealBlob(blob, 'sd|pdf|' + id) }); } while (Vault.keyGen() !== gen); }
+  finally { recWrites--; recSeq++; }
+}
 // returns the cached PDF only when it was built for exactly this signature; the large file is
 // decrypted only then
 async function pdfGet(id, want) {
@@ -108,7 +129,10 @@ async function pdfGet(id, want) {
 const thumbCache = new Map();
 async function thumbPut(id, t) {
   t = safeThumb(t); thumbCache.set(id, t);
-  if (t) await idb.put('thumbs', { id, t: await Vault.seal(utf8(t), 'sd|t|' + id) }); else await idb.del('thumbs', id);
+  if (!t) { await idb.del('thumbs', id); return; }
+  recWrites++; recSeq++;
+  try { let gen; do { gen = Vault.keyGen(); await idb.put('thumbs', { id, t: await Vault.seal(utf8(t), 'sd|t|' + id) }); } while (Vault.keyGen() !== gen); }
+  finally { recWrites--; recSeq++; }
 }
 async function thumbGet(id) {
   if (thumbCache.has(id)) return thumbCache.get(id);
@@ -117,7 +141,12 @@ async function thumbGet(id) {
   thumbCache.set(id, t); return t;
 }
 // After the local key was renewed: bring every stored record under the new key, one at a time,
-// then let go of the previous key. Safe to interrupt; it continues at the next start.
+// then let go of the previous key. Safe to interrupt: a small mark remembers how far the pass got
+// for this renewal, so the next start continues behind it. The previous keys go only after a
+// pass that began under the current key, with no record write in flight or landed during it, and
+// after the list, the sign-in entry and the cloud key were read back under the current key.
+// A field that no key opens is lost already; it is counted, reported once and does not keep the
+// old keys alive. A full storage ends the pass at once.
 let resealing = false;
 async function resealAll() {
   if (resealing || !docsLoaded || locked || passive || !Vault.isOpen() || !Vault.hasOldKeys()) return;
@@ -125,24 +154,51 @@ async function resealAll() {
   try {
     const FIELDS = { pages: ['m', 'jpeg', 'prev', 'orig'], pdfs: ['s', 'data'], thumbs: ['t'] };
     const label = (store, id, f) => store === 'pages' ? pLabel(id, f) : store === 'pdfs' ? 'sd|pdf|' + id + (f === 's' ? '|s' : '') : 'sd|t|' + id;
-    const same = (a, b) => { if (!a || !b || a.byteLength !== b.byteLength) return false; const x = new Uint8Array(a, 0, 12), y = new Uint8Array(b, 0, 12); return x.every((v, i) => v === y[i]); };
-    let failed = 0;
-    for (const store of Object.keys(FIELDS)) for (const id of await idb.keys(store)) {
+    for (let round = 0; round < 6; round++) {
+      const gen = Vault.keyGen(), rid = Vault.renewalId(), seq0 = recSeq;
+      let mark = null; try { mark = await idb.get('meta', 'reseal'); } catch (e) {}
+      if (!mark || mark.gen !== rid) mark = { id: 'reseal', gen: rid, last: {} };
+      let failed = 0, lost = 0, n = 0;
+      outer: for (const store of Object.keys(FIELDS)) {
+        const after = mark.last[store] || '';
+        for (const id of await idb.keys(store)) {
+          if (after && id <= after) continue;                       // done in an earlier run of this renewal; written later means written under the current key
+          if (passive || locked || !Vault.isOpen()) return;
+          try {
+            const r = await idb.get(store, id); if (!r) continue;
+            const upd = {};
+            for (const f of FIELDS[store]) if (r[f]) {
+              try { const nb = await Vault.reseal(r[f], label(store, id, f)); if (nb) upd[f] = { was: r[f], nb }; }
+              catch (e) { if (e && e.name === 'NoKey') lost++; else throw e; }
+            }
+            if (Object.keys(upd).length) await idb.cas(store, id, cur => {           // skip fields someone changed meanwhile: those are under the new key already
+              if (!cur) return; let ch = false;
+              for (const f in upd) if (sameIv(cur[f], upd[f].was)) { cur[f] = upd[f].nb; ch = true; }
+              return ch ? cur : undefined;
+            });
+            mark.last[store] = id; if (++n % 20 === 0) await idb.put('meta', mark).catch(() => {});
+          } catch (e) { failed++; if (e && e.name === 'QuotaExceededError') break outer; }
+        }
+      }
+      try { await idb.put('meta', mark); } catch (e) {}
+      if (failed) break;
+      if (!(await persist())) break;                                // the list under the current key, or no drop
+      const sr = await idb.get('meta', 'session');                  // the stored sign-in entry itself, not the one in memory
+      if (sr && sr.data) { const nb = await Vault.reseal(sr.data, 'sd|session'); if (nb) await idb.cas('meta', 'session', c => c && sameIv(c.data, sr.data) ? { id: 'session', data: nb } : undefined); }
+      if (!(await Vault.resealCloudKey())) break;
+      let under = true;                                             // read back: nothing in meta may still be under a previous key
+      for (const [id, aad] of [['docs', 'sd|docs'], ['session', 'sd|session']]) { const r = await idb.get('meta', id); if (r && r.data && (await Vault.reseal(r.data, aad)) !== null) under = false; }
+      if (!under) break;
+      while (recWrites > 0) await new Promise(r => setTimeout(r, 50));
       if (passive || locked || !Vault.isOpen()) return;
-      try {
-        const r = await idb.get(store, id); if (!r) continue;
-        const upd = {};
-        for (const f of FIELDS[store]) if (r[f]) { const nb = await Vault.reseal(r[f], label(store, id, f)); if (nb) upd[f] = { was: r[f], nb }; }
-        if (Object.keys(upd).length) await idb.cas(store, id, cur => {           // skip fields someone changed meanwhile: those are under the new key already
-          if (!cur) return; let ch = false;
-          for (const f in upd) if (same(cur[f], upd[f].was)) { cur[f] = upd[f].nb; ch = true; }
-          return ch ? cur : undefined;
-        });
-      } catch (e) { failed++; }
+      if (recSeq !== seq0 || Vault.keyGen() !== gen) continue;      // something was written during the pass: look once more
+      if (await Vault.dropOldKeys(gen)) {
+        await idb.del('meta', 'reseal').catch(() => {});
+        if (lost) toast(lost + (lost === 1 ? ' stored item' : ' stored items') + ' could not be read with any key and ' + (lost === 1 ? 'was' : 'were') + ' left behind.');
+        renderLockBox();
+      }
+      break;
     }
-    await persist(); if (session) await storeSession();
-    await Vault.resealCloudKey();
-    if (!failed && !passive) await Vault.dropOldKeys();
   } catch (e) {} finally { resealing = false; }
 }
 

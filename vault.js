@@ -21,6 +21,11 @@ const Vault = (() => {
   const te = new TextEncoder(), td = new TextDecoder();
   const KEYS_ID = 'keys', CK_ID = 'ck', PBKDF_ITER = 600000, BOX_FILE = 'snapdoc-devbox';
   let kv = null, rec = null, LK = null, LKraw = null, olds = [], CK = null, CKraw = null, ckUid = null;
+  let keyGen = 0, rotating = 0;      // keyGen rises with every renewal of LK; rotating > 0 while one is under way
+  // The key record is never changed in memory before it is stored: a refused write leaves memory
+  // and storage alike, so no lock can exist in memory only and no unlock can run on such a lock.
+  const copyRec = ch => Object.assign({}, rec, { lock: rec.lock && Object.assign({}, rec.lock), device: rec.device && Object.assign({}, rec.device), old: (rec.old || []).slice() }, ch);
+  async function commit(next) { await kv.put(next); rec = next; }
 
   const b64 = buf => { const u8 = buf instanceof Uint8Array ? buf : new Uint8Array(buf); let s = ''; for (let i = 0; i < u8.length; i += 0x8000) s += String.fromCharCode.apply(null, u8.subarray(i, i + 0x8000)); return btoa(s); };
   const unb64 = s => Uint8Array.from(atob(s), c => c.charCodeAt(0));
@@ -105,8 +110,8 @@ const Vault = (() => {
     if (!rec) {
       await setLK(rand(32));
       const ds = await deviceSlot();
-      rec = { id: KEYS_ID, v: 2, device: ds.slot, lock: null, dirty: !ds.clean, old: [] };
-      await kv.put(rec);
+      const first = { id: KEYS_ID, v: 2, device: ds.slot, lock: null, dirty: !ds.clean, old: [] };
+      await kv.put(first); rec = first;
       return 'open';
     }
     if (rec.v !== 2) { rec.v = 2; rec.dirty = true; rec.old = rec.old || []; }      // older format: its key box sat in the database
@@ -115,38 +120,40 @@ const Vault = (() => {
   }
   // A new local key for everything written from now on. The previous key is stored only wrapped
   // by the new one, so key material left behind in storage from before cannot open new data.
-  // setSlot(rawNew) writes the slot for the new key into rec; everything is saved in one step.
-  async function rotate(setSlot) {
-    const prev = [{ raw: LKraw, key: LK }].concat(olds);
-    const raw = rand(32), key = await importAes(raw), boxes = [];
-    for (const o of prev) boxes.push(await sealWith(key, o.raw, 'sd|lk|old'));
-    await setSlot(raw);
-    rec.old = boxes;
-    await kv.put(rec);
-    LKraw = raw; LK = key; olds = prev;
+  // fields(rawNew) returns the record fields that hold the slot for the new key; the new record
+  // is stored in one step and memory switches to the new key only after that.
+  async function rotate(fields) {
+    rotating++;
+    try {
+      const prev = [{ raw: LKraw, key: LK }].concat(olds);
+      const raw = rand(32), key = await importAes(raw), boxes = [];
+      for (const o of prev) boxes.push(await sealWith(key, o.raw, 'sd|lk|old'));
+      await commit(copyRec(Object.assign(await fields(raw), { old: boxes, gen: b64(rand(9)) })));      // gen: names this renewal for the re-encryption pass
+      LKraw = raw; LK = key; olds = prev; keyGen++;
+    } finally { rotating--; }
   }
   // Turn on a lock whose key (k) only the PIN or the screen lock can produce.
   async function enableKeyLock(lock, k, aad) {
     const hadFile = !!(rec.device && rec.device.opfs);
+    const withBox = async raw => ({ lock: Object.assign({}, lock, { box: await sealWith(k, raw, aad) }), device: null, dirty: false });
     if (rec.dirty || !hadFile) {
-      await rotate(async raw => { lock.box = await sealWith(k, raw, aad); rec.lock = lock; rec.device = null; rec.dirty = false; });
+      await rotate(withBox);
       if (hadFile) await boxRemove();
       return;
     }
     // clean install: store the lock first (both ways in still work), then remove the file for good
-    lock.box = await sealWith(k, LKraw, aad); rec.lock = lock;
-    await kv.put(rec);
-    if (await boxRemove()) { rec.device = null; await kv.put(rec); }
-    else await rotate(async raw => { lock.box = await sealWith(k, raw, aad); rec.device = null; rec.dirty = false; });
+    await commit(copyRec({ lock: Object.assign({}, lock, { box: await sealWith(k, LKraw, aad) }) }));
+    if (await boxRemove()) await commit(copyRec({ device: null }));
+    else await rotate(withBox);
   }
   // after a PIN / screen-lock unlock: finish a lock set-up that was interrupted, or renew a key
   // whose older copy may still linger in storage
   async function afterKeyUnlock(k, aad) {
     await loadOlds();
-    const L = rec.lock; if (!rec.device && !rec.dirty) return;
+    if (!rec.device && !rec.dirty) return;
     const gone = rec.device && rec.device.opfs ? await boxRemove() : false;
-    if (rec.device && gone && !rec.dirty) { rec.device = null; await kv.put(rec); return; }
-    await rotate(async raw => { L.box = await sealWith(k, raw, aad); rec.device = null; rec.dirty = false; });
+    if (rec.device && gone && !rec.dirty) { await commit(copyRec({ device: null })); return; }
+    await rotate(async raw => ({ lock: Object.assign({}, rec.lock, { box: await sealWith(k, raw, aad) }), device: null, dirty: false }));
   }
 
   // ---------- WebAuthn (fingerprint / screen lock) ----------
@@ -191,46 +198,59 @@ const Vault = (() => {
   // or failed confirmation throws; it never quietly becomes the weaker lock.
   async function setBiometric() {
     need(LK);
+    if (!rec.uh) await commit(copyRec({ uh: b64(rand(16)) }));      // one user handle per install: a retry replaces the earlier passkey instead of adding one
     const prfSalt = rand(32);
     const cred = await navigator.credentials.create({ publicKey: {
-      challenge: rand(32), rp: { name: 'Snapdoc', id: location.hostname }, user: { id: rand(16), name: 'Snapdoc', displayName: 'Snapdoc' },
+      challenge: rand(32), rp: { name: 'Snapdoc', id: location.hostname }, user: { id: unb64(rec.uh), name: 'Snapdoc', displayName: 'Snapdoc' },
       pubKeyCredParams: [{ type: 'public-key', alg: -7 }, { type: 'public-key', alg: -257 }],
       authenticatorSelection: { authenticatorAttachment: 'platform', userVerification: 'required', residentKey: 'preferred' },
       timeout: 60000, attestation: 'none', extensions: { prf: { eval: { first: prfSalt } } } } });
     const L = { credId: b64(cred.rawId), pubKey: null, alg: null };
-    try { const pk = cred.response.getPublicKey && cred.response.getPublicKey(); if (pk) { L.pubKey = b64(pk); L.alg = cred.response.getPublicKeyAlgorithm(); } } catch (e) {}
-    let ext = {}; try { ext = cred.getClientExtensionResults() || {}; } catch (e) {}
-    let out = ext.prf && ext.prf.results && ext.prf.results.first ? ext.prf.results.first : null;
-    if (!out && ext.prf && ext.prf.enabled)             // most phones release the secret only on a second confirmation
-      out = prfOut(await navigator.credentials.get({ publicKey: getOptions({ type: 'prf', credId: L.credId, prfSalt: b64(prfSalt) }, rand(32)) }));
-    if (out) {
-      L.type = 'prf'; L.prfSalt = b64(prfSalt);
-      await enableKeyLock(L, await hkdfKey(out), 'sd|lk|prf');
-      return 'prf';
+    try {
+      try { const pk = cred.response.getPublicKey && cred.response.getPublicKey(); if (pk) { L.pubKey = b64(pk); L.alg = cred.response.getPublicKeyAlgorithm(); } } catch (e) {}
+      let ext = {}; try { ext = cred.getClientExtensionResults() || {}; } catch (e) {}
+      let out = ext.prf && ext.prf.results && ext.prf.results.first ? ext.prf.results.first : null;
+      if (!out && ext.prf && ext.prf.enabled)             // most phones release the secret only on a second confirmation
+        out = prfOut(await navigator.credentials.get({ publicKey: getOptions({ type: 'prf', credId: L.credId, prfSalt: b64(prfSalt) }, rand(32)) }));
+      if (out) {
+        L.type = 'prf'; L.prfSalt = b64(prfSalt);
+        await enableKeyLock(L, await hkdfKey(out), 'sd|lk|prf');
+        return 'prf';
+      }
+      L.type = 'gate';
+      const ch = { lock: L };
+      if (!rec.device) { const ds = await deviceSlot(); ch.device = ds.slot; if (!ds.clean) ch.dirty = true; }
+      await commit(copyRec(ch));
+      return 'gate';
+    } catch (e) {                                       // the passkey made a moment ago is not in use: a browser that can is asked to remove it
+      try { if (self.PublicKeyCredential && PublicKeyCredential.signalUnknownCredential) await PublicKeyCredential.signalUnknownCredential({ rpId: location.hostname, credentialId: b64url(cred.rawId) }); } catch (e2) {}
+      throw e;
     }
-    L.type = 'gate';
-    if (!rec.device) { const ds = await deviceSlot(); rec.device = ds.slot; if (!ds.clean) rec.dirty = true; }
-    rec.lock = L; await kv.put(rec);
-    return 'gate';
   }
   async function setPin(pin) {
     need(LK);
     const salt = rand(16), k = await pbkdfKey(pin, salt, PBKDF_ITER);
     await enableKeyLock({ type: 'pin', salt: b64(salt), iter: PBKDF_ITER, numeric: /^\d+$/.test(pin) }, k, 'sd|lk|pin');
   }
+  // Under a gate lock the device slot exists and stays as it is: the key file is not touched, the
+  // record changes in one write. Under a key lock a new slot is written first; the stored record
+  // still opens the key through the lock until the new record is stored.
   async function clearLock() {
     need(LK);
-    const ds = await deviceSlot();
-    rec.device = ds.slot; rec.lock = null; if (!ds.clean) rec.dirty = true;
-    await kv.put(rec);
+    const ch = { lock: null };
+    if (!rec.device) { const ds = await deviceSlot(); ch.device = ds.slot; if (!ds.clean) ch.dirty = true; }
+    await commit(copyRec(ch));
   }
+  // The renewal after an unlock is not part of unlocking: if its write is refused, memory and
+  // storage are still alike and the stored lock opens this key; it is tried again next time.
+  async function finishUnlock(k, aad) { try { await afterKeyUnlock(k, aad); } catch (e) { await loadOlds().catch(() => {}); } }
   async function unlock(secret, signal) {
     const L = rec.lock;
     if (!L) { await openDevice(); await loadOlds(); return; }
     if (L.type === 'pin') {
       const k = await pbkdfKey(secret || '', unb64(L.salt), L.iter);
       let raw; try { raw = await openWith(k, L.box, 'sd|lk|pin'); } catch (e) { throw new Error('Wrong PIN or password'); }
-      await setLK(raw); await afterKeyUnlock(k, 'sd|lk|pin'); return;
+      await setLK(raw); await finishUnlock(k, 'sd|lk|pin'); return;
     }
     const challenge = rand(32);
     const a = await navigator.credentials.get({ publicKey: getOptions(L, challenge), signal });
@@ -238,7 +258,7 @@ const Vault = (() => {
       const out = prfOut(a); if (!out) throw new Error('The screen lock did not release the key.');
       const k = await hkdfKey(out);
       let raw; try { raw = await openWith(k, L.box, 'sd|lk|prf'); } catch (e) { throw new Error('This screen lock does not match the one that locked the app.'); }
-      await setLK(raw); await afterKeyUnlock(k, 'sd|lk|prf'); return;
+      await setLK(raw); await finishUnlock(k, 'sd|lk|prf'); return;
     }
     await verifyAssertion(a, challenge, L);
     await openDevice(); await loadOlds();
@@ -248,9 +268,16 @@ const Vault = (() => {
   async function reseal(buf, aad) {
     try { await openWith(need(LK), buf, aad); return null; } catch (e) {}
     for (const o of olds) { let plain; try { plain = await openWith(o.key, buf, aad); } catch (e) { continue; } return sealWith(LK, plain, aad); }
-    throw new Error('a stored record cannot be opened with any key');
+    const e = new Error('a stored record cannot be opened with any key'); e.name = 'NoKey'; throw e;
   }
-  async function dropOldKeys() { need(LK); rec.old = []; await kv.put(rec); olds = []; }
+  // gen: the key generation the pass worked under. Refused while a renewal runs or after one
+  // happened meanwhile, because records the pass handled would then sit under a key that is old again.
+  async function dropOldKeys(gen) {
+    need(LK); if (rotating || gen !== keyGen) return false;
+    await commit(copyRec({ old: [] }));
+    if (rotating || gen !== keyGen) return false;
+    olds = []; return true;
+  }
 
   // ---------- cloud key and its password envelope ----------
   async function loadCloudKey(uid) {
@@ -263,9 +290,11 @@ const Vault = (() => {
     CKraw = new Uint8Array(raw); CK = await importAes(CKraw); ckUid = uid;
     await kv.put({ id: CK_ID, uid, box: await sealWith(need(LK), CKraw, 'sd|ck|local|' + uid) });
   }
+  // true once the stored cloud key is under the current local key (read back, not assumed)
   async function resealCloudKey() {
-    const r = await kv.get(CK_ID); if (!r) return;
+    const r = await kv.get(CK_ID); if (!r) return true;
     const nb = await reseal(r.box, 'sd|ck|local|' + r.uid); if (nb) await kv.put({ id: CK_ID, uid: r.uid, box: nb });
+    const back = await kv.get(CK_ID); return !back || (await reseal(back.box, 'sd|ck|local|' + back.uid)) === null;
   }
   async function wrapEnvelope(raw, password, uid) {
     const salt = rand(16), k = await pbkdfKey(password, salt, PBKDF_ITER);
@@ -295,9 +324,9 @@ const Vault = (() => {
   return {
     load, unlock, setBiometric, setPin, clearLock, biometricAvailable, suggestPassword,
     isOpen: () => !!LK, lockType: () => rec && rec.lock ? rec.lock.type : null, pinIsNumeric: () => !!(rec && rec.lock && rec.lock.numeric),
-    hasOldKeys: () => olds.length > 0, reseal, resealCloudKey, dropOldKeys,
+    hasOldKeys: () => olds.length > 0, reseal, resealCloudKey, dropOldKeys, keyGen: () => keyGen, renewalId: () => (rec && rec.gen) || '',
     seal: (data, aad) => sealWith(need(LK), data, aad), open: openLocal,
-    sealBlob: async (blob, aad) => sealWith(need(LK), await blob.arrayBuffer(), aad),
+    sealBlob: async (blob, aad) => { const data = await blob.arrayBuffer(); return sealWith(need(LK), data, aad); },      // the key is chosen after the wait, never before
     openBlob: async (buf, aad, type) => new Blob([await openLocal(buf, aad)], { type: type || 'application/octet-stream' }),
     sealJson: (obj, aad) => sealWith(need(LK), te.encode(JSON.stringify(obj)), aad),
     openJson: async (buf, aad) => JSON.parse(td.decode(await openLocal(buf, aad))),

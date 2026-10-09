@@ -111,7 +111,19 @@ Everything is encrypted with AES-256-GCM, all in `vault.js` (WebCrypto, no libra
   - If an older copy of the key may still linger in storage (an install from before version 3, or
     a browser without private files), turning a lock on makes a **new key** for everything written
     from then on. The previous key stays reachable only through the new one, older records are
-    re-encrypted in the background, and then the previous key is dropped.
+    re-encrypted in the background, and then the previous key is dropped. A record write that
+    began under the previous key is stored once more under the new one, and the previous key goes
+    only after a pass that began under the current key, with nothing in flight, and after the
+    list, the sign-in entry and the cloud key were read back under the new key. A second renewal
+    during the pass starts the pass over. The pass remembers how far it got, so a restart
+    continues behind it; a record that no key opens is lost already, is reported once and does
+    not keep the old keys alive.
+  - The key record is never changed in memory before it is stored. A refused write (storage full)
+    leaves memory and storage alike: no lock exists in memory only, and no unlock can run on such
+    a lock. Turning a gate lock off is one record write; the key file is not touched. Key-record
+    writes ask for strict durability, so the file is removed only after the record that no longer
+    needs it is on disk. One passkey handle per install: a cancelled or repeated set-up replaces
+    the earlier passkey instead of adding one.
   - Honest limit: a web page cannot scrub the browser's storage files. Scans stored before a lock
     was turned on can remain recoverable from a forensic copy of the storage for some time. Turn
     the lock on before scanning anything sensitive.
@@ -132,7 +144,11 @@ Everything is encrypted with AES-256-GCM, all in `vault.js` (WebCrypto, no libra
   and the one Supabase project only, and no inline script.
 - **Shared web address.** All of the owner's GitHub Pages apps live on one origin, which
   browsers treat as one site: a script running in a sibling app could reach Snapdoc's storage.
-  With a key-bound lock the key is out of its reach. Full separation needs an address of its own.
+  With a key-bound lock such a script cannot read the key silently; it could still ask the phone
+  for the same fingerprint confirmation and, if the owner confirms, unwrap the key, because the
+  passkey is bound to the shared hostname and its record is readable on the shared origin. Full
+  separation needs an address of its own; that move also re-binds the passkey, so the lock is set
+  up again on the new address.
 
 ## The lock screen
 
@@ -279,6 +295,8 @@ and do not fork copies.
 - v10: sync format 4 (one file per version, conditional entry writes, bookmark inside the list,
   back-off for refused uploads, a pass that stops with the window); fixes for the sync findings
   of review round 2 (see `REVIEW.md`).
+- v11: the key record is copy-on-write, the key renewal cannot strand a record (see
+  "Encryption"); fixes for the vault and storage findings of review round 2.
 
 ## Tested, and not yet
 

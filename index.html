@@ -42,6 +42,16 @@
   .card .cloud { font-size: 13px; color: var(--muted); flex: none; min-width: 22px; text-align: right; }
   .card .cloud.ok { color: var(--accent); }
   .card .cloud.busy { color: #b7791f; }
+  /* search and multi-select on the home list */
+  .searchrow { display: flex; gap: 8px; padding: 0 16px 8px; align-items: center; }
+  .searchrow input { flex: 1; min-width: 0; height: 40px; border: 1px solid var(--line); border-radius: 20px; background: var(--card); padding: 0 14px; font-size: 15px; }
+  .searchrow input:focus { outline: none; border-color: var(--accent); }
+  .searchrow .pill.on { background: var(--accent); color: #fff; border-color: transparent; }
+  .card.sel { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent); background: var(--accent-bg); }
+  .card .tick { width: 26px; height: 26px; border-radius: 13px; border: 2px solid var(--line); flex: none; display: flex; align-items: center; justify-content: center; color: #fff; font-size: 15px; font-weight: 700; }
+  .card.sel .tick { background: var(--accent); border-color: var(--accent); }
+  .card.sel .tick::after { content: '✓'; }
+  #selDock .secondary { padding: 0 14px; }
 
   /* thumb zone */
   .dock { position: fixed; left: 50%; transform: translateX(-50%); bottom: 0; width: 100%; max-width: 480px; padding: 14px 16px calc(env(safe-area-inset-bottom) + 18px); z-index: 4; display: flex; align-items: center; justify-content: center; gap: 10px; background: linear-gradient(to top, var(--bg) 70%, rgba(245,243,238,0)); }
@@ -198,12 +208,21 @@
       <button id="menuBtn" class="pill">Menu</button>
     </header>
     <div id="syncline" class="subline"></div>
+    <div class="searchrow" id="searchRow" hidden>
+      <input id="searchBox" type="search" autocomplete="off" placeholder="Search" aria-label="Search documents">
+      <button id="selectBtn" class="pill">Select</button>
+    </div>
     <div id="list" class="scroll"></div>
   </div>
-  <div class="dock">
+  <div class="dock" id="scanDock">
     <button id="scanBtn" class="fab" aria-label="Scan a document">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 8V6a2 2 0 0 1 2-2h2M16 4h2a2 2 0 0 1 2 2v2M20 16v2a2 2 0 0 1-2 2h-2M8 20H6a2 2 0 0 1-2-2v-2"/><rect x="7" y="7" width="10" height="10" rx="1.5"/></svg>
     </button>
+  </div>
+  <div class="dock" id="selDock" hidden>
+    <button id="selShare" class="primary">Share</button>
+    <button id="selSave" class="secondary">Save</button>
+    <button id="selCancel" class="secondary">Cancel</button>
   </div>
 </section>
 

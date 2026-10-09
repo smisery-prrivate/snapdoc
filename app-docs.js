@@ -10,23 +10,79 @@ function cloudGlyph(d) {
   if (d.pushed_rev < d.rev || rowBehind(d)) return '<span class="cloud busy" title="Waiting to upload">☁↑</span>';
   return '<span class="cloud ok" title="In the cloud, encrypted">☁✓</span>';
 }
+// Search filters the list by name and date. Select turns the list into a pick list: a tap on a
+// document selects it instead of opening it, and the bar at the bottom shares or saves the
+// chosen PDFs at once.
+let homeQuery = '', selectMode = false; const selected = new Set();
+const homeLabel = d => d.name.trim() || dateStamp(d.created_at);
+const matches = d => !homeQuery || (homeLabel(d) + ' ' + fmtDate(d.created_at) + ' ' + dateStamp(d.created_at)).toLowerCase().includes(homeQuery);
 function renderHome() {
-  const list = $('list'), items = alive(), st = list.scrollTop;
+  const list = $('list'), all = alive(), st = list.scrollTop;
+  for (const id of selected) { const d = byId(id); if (!d || d.deleted) selected.delete(id); }
+  $('searchRow').hidden = !all.length && !homeQuery;
+  $('selectBtn').classList.toggle('on', selectMode);
+  $('scanDock').hidden = selectMode; $('selDock').hidden = !selectMode;
+  const n = selected.size;
+  $('selShare').textContent = n ? 'Share ' + n + (n === 1 ? ' PDF' : ' PDFs') : 'Share'; $('selSave').textContent = 'Save';
+  $('selShare').disabled = !n; $('selSave').disabled = !n;
+  const items = all.filter(matches);
   list.innerHTML = '';
   if (!items.length) {
-    list.innerHTML = '<div class="empty"><b>No scans yet</b>Tap the big button and point the camera at a document. Batch mode puts several pages into one PDF.</div>';
+    list.innerHTML = all.length ? '<div class="empty"><b>Nothing found</b>No document matches "' + esc(homeQuery) + '".</div>'
+      : '<div class="empty"><b>No scans yet</b>Tap the big button and point the camera at a document. Batch mode puts several pages into one PDF.</div>';
     return;
   }
   for (const d of items) {
-    const el = document.createElement('div'); el.className = 'card';
+    const el = document.createElement('div'); el.className = 'card' + (selectMode && selected.has(d.id) ? ' sel' : '');
     const n = d.pages.length || d.pageCount || 0;
-    el.innerHTML = '<div class="th"></div><div class="body"><div class="name">' + esc(d.name.trim() || dateStamp(d.created_at)) + '</div><div class="meta">' + esc(fmtDate(d.created_at)) + ' · ' + n + (n === 1 ? ' page' : ' pages') + (d.size ? ' · ' + fmtSize(d.size) : '') + '</div></div>' + cloudGlyph(d);
+    el.innerHTML = '<div class="th"></div><div class="body"><div class="name">' + esc(homeLabel(d)) + '</div><div class="meta">' + esc(fmtDate(d.created_at)) + ' · ' + n + (n === 1 ? ' page' : ' pages') + (d.size ? ' · ' + fmtSize(d.size) : '') + '</div></div>' + (selectMode ? '<div class="tick"></div>' : cloudGlyph(d));
     thumbGet(d.id).then(t => { if (!t || !el.isConnected) return; const img = new Image(); img.className = 'th'; img.alt = ''; img.src = t; el.replaceChild(img, el.firstChild); });
-    el.addEventListener('click', () => openDoc(d));
+    el.addEventListener('click', () => {
+      if (!selectMode) { openDoc(d); return; }
+      if (!hasContent(d)) { toast(STILL_DOWNLOADING); return; }
+      if (selected.has(d.id)) selected.delete(d.id); else selected.add(d.id);
+      renderHome();
+    });
     list.appendChild(el);
   }
   list.scrollTop = st;
 }
+$('searchBox').addEventListener('input', e => { homeQuery = e.target.value.trim().toLowerCase(); renderHome(); });
+$('searchBox').addEventListener('keydown', e => { if (e.key === 'Enter') e.target.blur(); });
+function setSelectMode(on) { selectMode = on; if (!on) selected.clear(); renderHome(); }
+$('selectBtn').addEventListener('click', () => setSelectMode(!selectMode));
+$('selCancel').addEventListener('click', () => setSelectMode(false));
+// the chosen documents as PDF files, built one after the other
+let selBusy = false;
+async function selectedPdfs() {
+  const out = [];
+  for (const id of selected) {
+    const d = byId(id); if (!d || d.deleted) continue;
+    if (!hasContent(d)) throw new Error('"' + homeLabel(d) + '" is still downloading');
+    out.push({ d, blob: await getPdf(d) });
+  }
+  return out;
+}
+async function selAction(share) {
+  if (selBusy || !selected.size) return;
+  selBusy = true; busy(true); $('selShare').disabled = true; $('selSave').disabled = true;
+  try {
+    const pdfs = await selectedPdfs();
+    if (!pdfs.length) return;
+    const files = pdfs.map(p => new File([p.blob], fileName(p.d), { type: 'application/pdf' }));
+    if (share && navigator.canShare && navigator.canShare({ files })) {
+      try { holdReloadUntil = Date.now() + 600000; await navigator.share({ files, title: files.length === 1 ? files[0].name : files.length + ' PDFs' }); setSelectMode(false); }
+      catch (e) { const n = e && e.name; if (n !== 'AbortError' && n !== 'InvalidStateError') toast(n === 'NotAllowedError' ? 'Tap Share again to open the share sheet.' : 'Sharing failed: ' + errText(e)); }
+      finally { holdReloadUntil = 0; }
+      return;
+    }
+    for (const f of files) { downloadBlob(f, f.name); await new Promise(r => setTimeout(r, 250)); }      // browsers without a share sheet (desktop): one file after the other
+    toast('Saved ' + files.length + (files.length === 1 ? ' PDF' : ' PDFs')); setSelectMode(false);
+  } catch (e) { toast('Could not build the PDFs: ' + errText(e)); }
+  finally { selBusy = false; busy(false); renderHome(); }
+}
+$('selShare').addEventListener('click', () => selAction(true));
+$('selSave').addEventListener('click', () => selAction(false));
 $('scanBtn').addEventListener('click', () => openCamera(null));
 $('menuBtn').addEventListener('click', () => openSheet());
 

@@ -3,7 +3,7 @@
 // go at install time and served only from this set, so the page never runs a mix of two versions
 // and starts at once without waiting for the network. A new release arrives as a new worker
 // (the browser checks sw.js on every start); the page restarts itself when that worker takes over.
-const CACHE = 'snapdoc-v6';
+const CACHE = 'snapdoc-v7';
 const ASSETS = ['.', 'index.html', 'vault.js', 'app-core.js', 'app-docs.js', 'app-cam.js', 'app-lock.js', 'app-sync.js', 'app-boot.js', 'imaging.js', 'worker.js', 'config.js', 'manifest.json', 'icon-192.png', 'icon-512.png'];
 
 self.addEventListener('install', e => {

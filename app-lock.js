@@ -4,7 +4,7 @@ let locked = false, softLock = false, unlocking = false, hiddenAt = 0, holdReloa
 const unlockWaiters = [];
 const COVERED = ['home', 'doc', 'edit', 'cam', 'sheet'];
 // shotsPending: the shutter has fired and the photo is not there yet. That shot is work in flight too.
-const workInFlight = () => shotsPending > 0 || qLen > 0 || syncing || Date.now() < holdReloadUntil || current() === 'edit' || (current() === 'cam' && camCount > 0) || edApplying || pdfBuilding;
+const workInFlight = () => shotsPending > 0 || selBusy || qLen > 0 || syncing || Date.now() < holdReloadUntil || current() === 'edit' || (current() === 'cam' && camCount > 0) || edApplying || pdfBuilding;
 
 // ---------- lock screen ----------
 // soft = shown over a running app because work is still in flight; the page restarts (and the key

@@ -171,9 +171,18 @@ The script files share one scope and load in the order above. There is no build 
 ## Sync rules
 
 - Local first. The app works fully without an account.
-- One entry per document (`sd_documents`) and one encrypted file (`sd/<user>/<document id>`).
+- One entry per document (`sd_documents`) and one encrypted file per version of its pages
+  (`sd/<user>/<document id>.<tag>`). A file is never overwritten: a new version gets a new file,
+  the entry names the version, and the file of the version before is removed once the entry has
+  moved on. Files written before format 4 (`sd/<user>/<document id>`) are still read.
 - **Pages** have a revision and a random tag. A device uploads when its pages are newer than what
-  the cloud last agreed on, and downloads when the cloud has moved on.
+  the cloud last agreed on, and downloads when the cloud has moved on. An upload alone proves
+  nothing: a version counts as synced only once the cloud has accepted the entry that names it.
+- **Entries are written conditionally.** Each device remembers the server stamp of the entry it
+  last saw and writes only if the cloud still holds that one (the first entry of a document is
+  inserted, never upserted). If another device was first, its entry is taken in and the write is
+  tried once more. A late write from a stale pass can therefore never replace a newer entry; a
+  device that still holds the newer state sends it again.
 - **Both changed the pages** since they last agreed: nothing is overwritten. The device keeps its
   own version as a separate document, "… (copy from this device)", and takes the cloud version.
 - **Pages cannot be added or changed while a newer version is still downloading.** A page that is
@@ -181,11 +190,19 @@ The script files share one scope and load in the order above. There is no build 
 - **Name and deletion** follow the later change. A document deleted on one device and renamed
   later on another comes back whole: the renaming device uploads the file again.
 - The server stamps each write (`synced_at`); devices pull everything stamped after their last
-  visit, with a three-second overlap. Entries are idempotent.
-- Deletes are sealed markers; the file is removed from the bucket and that removal is repeated
-  until the cloud confirms it.
-- One document that cannot be uploaded (too large, a page missing) is named in the status and
-  does not hold up the others.
+  visit, with a three-second overlap. Entries are idempotent. The bookmark of the last visit is
+  stored inside the encrypted document list, in the same write, so it can never be ahead of the
+  list it belongs to.
+- Deletes are sealed markers and are written once. The files are removed from the bucket only
+  after the cloud has confirmed that the marker is still the current entry; that removal is
+  repeated until it succeeds. A document deleted on one device and brought back by a later change
+  on another is downloaded again; a device whose pages are the only ones left sends them again.
+- One document that cannot be uploaded (too large, a page missing) or whose entry cannot be
+  saved is named in the status and does not hold up the others. A refused upload is tried again
+  after a growing pause (1 min, 4 min, 16 min, ... up to an hour), not on every pass; "Sync now"
+  tries at once.
+- A pass stops as soon as the window is no longer the active one, the lock closes, the account
+  changes or the window is handed over; a running request is cut off then.
 - A PDF is never built or uploaded with a page left out.
 - Every device downloads every PDF, so all documents are available offline.
 - Sync status is always visible on the home screen; failures show their reason in the menu.
@@ -241,7 +258,9 @@ Free Supabase projects pause after a week without requests; restart in the dashb
 `VERSION` in `app-core.js`, `CACHE` in `sw.js` and the commit message move together. New
 files go into the `ASSETS` list in `sw.js`. A cloud schema change ships the tolerant client
 first, then the migration. A change of the sync format bumps `SYNC_FMT` in `app-sync.js`, which
-makes every device send what it holds once more in the new form.
+makes every device send what it holds once more in the new form; what a device last agreed on
+with the cloud is kept through that step, so the other devices recognise the re-sent versions
+and do not fork copies.
 
 ## History
 
@@ -257,6 +276,9 @@ makes every device send what it holds once more in the new form.
 - v7: search field and pick mode on the home list (share or save several PDFs at once).
 - v8: Google Drive copies (plain PDFs in the user's own Drive, uploaded from the device).
 - v9: long press picks a document, Delete for several documents at once.
+- v10: sync format 4 (one file per version, conditional entry writes, bookmark inside the list,
+  back-off for refused uploads, a pass that stops with the window); fixes for the sync findings
+  of review round 2 (see `REVIEW.md`).
 
 ## Tested, and not yet
 

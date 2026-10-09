@@ -7,7 +7,7 @@
    cloud key together with its revision, change time and delete flag), delete a document on a
    device by forging a delete marker, or hand out an older file for a newer entry (the file
    carries its revision inside the encryption). */
-const SYNCUID_KEY = 'snapdoc.syncUid', LINK_KEY = 'snapdoc.linkAsked', FMT_KEY = 'snapdoc.syncFmt', SYNC_FMT = '3', MAX_FILE = 52428800;
+const SYNCUID_KEY = 'snapdoc.syncUid', LINK_KEY = 'snapdoc.linkAsked', FMT_KEY = 'snapdoc.syncFmt', SYNC_FMT = '4', MAX_FILE = 52428800;
 let session = null, syncTimer = null, syncing = false, syncAgain = false, syncState = '', syncMsg = '';
 let keyNeed = '', keyEnv = null, keyBusy = false;      // keyNeed: '' | 'create' | 'enter' | 'change'
 
@@ -46,8 +46,8 @@ async function adoptLink(t) {
   session = { access_token: t.access_token, refresh_token: t.refresh_token, expires_at: p.exp, email: u.email || '', uid: u.id };
   await storeSession();
   if (localStorage.getItem(SYNCUID_KEY) !== session.uid) {       // first sign-in, or another account: this cloud knows nothing from here yet
-    for (const d of docs) { d.srv = 0; d.pushed_rev = 0; d.pushed_tag = ''; d.row_rev = 0; d.cloudPurged = false; }
-    localStorage.removeItem(cursorKey()); localStorage.setItem(SYNCUID_KEY, session.uid);
+    for (const d of docs) { d.srv = 0; d.pushed_rev = 0; d.pushed_tag = ''; d.up_rev = 0; d.up_tag = ''; d.row_rev = 0; d.seen = 0; d.cloudPurged = false; }
+    cursors[session.uid] = 0; localStorage.removeItem(cursorKey()); localStorage.setItem(SYNCUID_KEY, session.uid);
     await Vault.dropCloudKey(); persist();
   }
   await Vault.loadCloudKey(session.uid).catch(() => {});
@@ -84,15 +84,18 @@ async function httpError(what, r) {
   if (r.status === 413) return new Error(what + ' failed: the file is too large for the cloud.');
   return new Error(what + ' failed (' + r.status + ') ' + t.slice(0, 100));
 }
-// One-time step when the sync format changes: everything this device holds is sent again in the new form.
+// One-time step when the sync format changes: everything this device holds is sent again in the new
+// form. What the device agreed on with the cloud (pushed_rev/pushed_tag) is kept, so the other
+// devices recognise the re-sent versions as the ones they hold and do not fork copies. A version
+// from before tags gets the same tag on every device.
 function syncFormatCheck() {
   let f = ''; try { f = localStorage.getItem(FMT_KEY) || ''; } catch (e) {}
   if (f === SYNC_FMT) return;
   for (const d of docs) {
     if (d.srv > 0) d.srv = -1;
-    d.row_rev = 0;
-    if (!d.rtag) d.rtag = newTag();
-    if (!d.deleted && d.rev_have === d.rev && d.pages.length) { d.pushed_rev = 0; d.pushed_tag = ''; }
+    d.row_rev = 0; d.seen = 0;
+    if (!d.rtag) { d.rtag = 'v2'; if (d.pushed_rev === d.rev && !d.pushed_tag) d.pushed_tag = 'v2'; }
+    if (!d.deleted && d.rev_have === d.rev && d.pages.length) { d.up_rev = 0; d.up_tag = ''; }
   }
   try { localStorage.setItem(FMT_KEY, SYNC_FMT); } catch (e) {}
   if (docs.length) persist();
@@ -137,15 +140,31 @@ async function submitKey(pw, pw2, hint) {
 }
 
 // ---------- sync loop ----------
+// Rules (version 4 of the format):
+// - Every version of a document's pages is its own file in the cloud, named after the document and
+//   the version's tag. A file is never replaced, so an entry can never point at a file another
+//   device wrote over.
+// - The entry is the only commit point. It is written with a condition on the server stamp the
+//   device last saw; if another device wrote in between, the write fails, the entry is pulled and
+//   the usual "both changed" rule decides (fork into a copy, never overwrite).
+// - A file upload alone proves nothing: pushed_rev/pushed_tag mean "the cloud accepted an entry for
+//   this version", up_rev/up_tag mean "this version's file is up".
+// - The pull bookmark lives inside the encrypted document list and is stored together with it, so
+//   it can never be ahead of the list.
 function setSyncState(s, msg) { syncState = s; syncMsg = msg || ''; renderSyncLine(); renderSyncBox(); }
 function scheduleSync() { if (!SYNC || !session || passive) return; clearTimeout(syncTimer); syncTimer = setTimeout(syncNow, 1500); }
+let syncCtl = null; const upFail = new Map();           // upFail: document id -> { rev, tag, n, until } for uploads the cloud refused
+function abortSync() { if (syncCtl) syncCtl.abort(); }
+function syncRetry() { upFail.clear(); if (syncState === 'error') setSyncState(''); syncNow(); }      // "Sync now": refused uploads are tried again at once
+const objName = (u, d, tag) => u + '/' + d.id + (tag ? '.' + tag : '');
+const adoptCloud = (d, rev, tag, m) => { d.rev = rev; d.rtag = tag; d.pushed_rev = rev; d.pushed_tag = tag; d.up_rev = rev; d.up_tag = tag; d.pageCount = +m.pages || 0; d.size = +m.size || 0; };
 // Both this device and another one changed the pages since they last agreed. Nothing is
 // overwritten: the version of this device lives on as a copy of its own.
 function forkLocal(d) {
   const mine = d.pages.filter(p => !p.status && !p.local); if (!mine.length) return;
   const now = Date.now(), name = (d.name || '').trim() || dateStamp(d.created_at);
   const c = migrate({ id: uid(), name: name + ' (copy from this device)', created_at: d.created_at, updated_at: now, srv: 0, pages: mine, pageCount: mine.length,
-    size: mine.reduce((a, p) => a + (p.size || 0), 0), rev: now, rtag: newTag(), rev_have: now, pushed_rev: 0, deleted: false });
+    size: mine.reduce((a, p) => a + (p.size || 0), 0), rev: now, rtag: newTag(), rev_have: now, pushed_rev: 0, up_rev: 0, deleted: false });
   docs.push(c); snap[c.id] = sigOf(c);
   d.pages = d.pages.filter(p => p.status || p.local);
   for (const p of mine) dropPrev(p.id);
@@ -155,7 +174,7 @@ function forkLocal(d) {
 }
 // One entry from the cloud. Returns 'legacy' for entries written before they were sealed.
 async function applyRow(row) {
-  const id = String(row.id), rev = +row.rev || 0, upd = +row.updated_at || 0, del = !!row.deleted;
+  const id = String(row.id), rev = +row.rev || 0, upd = +row.updated_at || 0, del = !!row.deleted, stamp = +row.synced_at || 0;
   const d0 = byId(id);
   if (!d0 && del) return 'skip';                                  // a delete marker for something this device never had
   if (!row.meta) return 'legacy';
@@ -165,46 +184,77 @@ async function applyRow(row) {
   const tag = del ? '' : String(m.tag || '');
   if (!d0) {
     const n = migrate({ id, name: String(m.name || ''), created_at: +m.created_at || upd, updated_at: upd, srv: upd, pages: [], pageCount: +m.pages || 0, size: +m.size || 0,
-      rev, rtag: tag, rev_have: -1, pushed_rev: rev, pushed_tag: tag, row_rev: rev, deleted: false });
+      rev, rtag: tag, rev_have: -1, pushed_rev: rev, pushed_tag: tag, up_rev: rev, up_tag: tag, row_rev: rev, seen: stamp, deleted: false });
     docs.push(n); snap[id] = sigOf(n); return 'new';
   }
-  const d = d0, before = sigOf(d);
-  d.row_rev = rev;
-  if (!del) {                                                     // pages: has the cloud moved on from what this device last agreed with?
-    const cloudNew = rev > d.pushed_rev || (rev === d.pushed_rev && !!tag && !!d.pushed_tag && tag !== d.pushed_tag);
-    if (cloudNew) {
-      const inSync = d.rev === d.pushed_rev && (d.rtag || '') === (d.pushed_tag || '');
-      if (!inSync && d.rev_have === d.rev && !(d.rev === rev && (d.rtag || '') === tag)) forkLocal(d);
-      const holdsIt = d.rev_have === rev && (d.rtag || '') === tag && d.rev === rev;
-      d.rev = rev; d.rtag = tag; d.pushed_rev = rev; d.pushed_tag = tag; d.pageCount = +m.pages || 0; d.size = +m.size || 0;
-      if (!holdsIt) d.rev_have = -1;                              // the pages here are not that version: download
+  const d = d0, before = sigOf(d), wasDeleted = d.deleted;
+  d.row_rev = rev; d.seen = stamp;
+  if (!del) {
+    if (wasDeleted && upd > d.updated_at) {                       // it comes back: its pages were removed here, there is nothing local to keep
+      adoptCloud(d, rev, tag, m); d.rev_have = -1; d.cloudPurged = false;
+    } else {                                                      // pages: has the cloud moved on from what this device last agreed with?
+      const cloudNew = rev > d.pushed_rev || (rev === d.pushed_rev && !!tag && !!d.pushed_tag && tag !== d.pushed_tag);
+      if (cloudNew) {
+        const inSync = d.rev === d.pushed_rev && (d.rtag || '') === (d.pushed_tag || '');
+        if (!inSync && !wasDeleted && d.rev_have === d.rev && !(d.rev === rev && (d.rtag || '') === tag)) forkLocal(d);
+        const holdsIt = d.rev_have === rev && (d.rtag || '') === tag && d.rev === rev;
+        adoptCloud(d, rev, tag, m);
+        if (!holdsIt) d.rev_have = -1;                            // the pages here are not that version: download
+      } else if (rev < d.pushed_rev && !wasDeleted) {             // the cloud went back to older pages (a device that never saw ours brought it back)
+        if (d.rev_have === d.rev && d.pages.some(p => !p.status)) { d.pushed_rev = rev; d.pushed_tag = tag; d.up_rev = 0; d.up_tag = ''; }   // ours is newer: file and entry go up again
+        else { adoptCloud(d, rev, tag, m); d.rev_have = -1; }
+      }
     }
   }
   if (upd > d.updated_at) {                                       // name and deletion: the later change wins
-    const wasDeleted = d.deleted;
     if (!del) { d.name = String(m.name || ''); d.created_at = +m.created_at || d.created_at; }
     d.deleted = del; d.updated_at = upd; d.srv = upd;
-    if (wasDeleted && !del) { d.rev_have = -1; d.cloudPurged = false; }                  // it came back: its pages were removed here, fetch them again
     if (del && !wasDeleted) { await purgeDocData(d); if (curDoc === d && current() === 'doc') { toast('This document was deleted on another device.'); back(); } }
   } else if (upd === d.updated_at) d.srv = upd;
   else if (del && !d.deleted) {                                   // our later change keeps the document, but the other device removed the file
-    if (d.rev_have === d.rev && d.pages.some(p => !p.status)) { d.pushed_rev = 0; d.pushed_tag = ''; }   // send the file again before our entry goes out
-    else { d.deleted = true; d.updated_at = upd; d.srv = upd; await purgeDocData(d); }                   // nobody holds the pages any more
-  }
+    if (d.pages.some(p => !p.status)) {                           // the pages here are the only ones left: they are the newest version and go up again
+      if (d.rev_have !== d.rev) { d.rev = Math.max(Date.now(), d.rev + 1); d.rtag = newTag(); d.rev_have = d.rev; d.pageCount = d.pages.filter(p => !p.status).length; }
+      d.pushed_rev = 0; d.pushed_tag = ''; d.up_rev = 0; d.up_tag = ''; d.srv = -1;
+    } else { d.deleted = true; d.updated_at = upd; d.srv = upd; await purgeDocData(d); if (curDoc === d && current() === 'doc') { toast('This document was deleted on another device.'); back(); } }
+  } else { d.srv = -1; if (d.deleted) d.cloudPurged = false; }    // the cloud holds an older entry than ours (a late write replaced it): send ours again
   if (snap[id] === before) snap[id] = sigOf(d);                   // a local change that is not saved yet is never swallowed
   return 'ok';
 }
 const sealedMeta = d => Vault.csealJson(d.deleted ? { del: true, u: d.updated_at }
-  : { name: d.name, pages: d.pages.filter(p => !p.status && !p.local).length || d.pageCount || 0, size: d.size || 0, created_at: d.created_at, rev: d.pushed_rev || 0, tag: d.pushed_tag || '', u: d.updated_at, del: false }, 'sd|meta|' + d.id);
+  : { name: d.name, pages: d.pages.filter(p => !p.status && !p.local).length || d.pageCount || 0, size: d.size || 0, created_at: d.created_at, rev: d.up_rev || 0, tag: d.up_tag || '', u: d.updated_at, del: false }, 'sd|meta|' + d.id);
+// does the cloud entry of this document have to be written?
+const entryDue = d => d.deleted ? ((d.srv !== 0 || d.pushed_rev > 0) && d.srv !== d.updated_at)
+  : d.up_rev > 0 && (d.up_rev !== d.pushed_rev || (d.up_tag || '') !== (d.pushed_tag || '') || d.updated_at !== d.srv);
+// One conditional write of the entry. true: accepted. false: another device wrote first (the entry is pulled again).
+async function writeEntry(d, u) {
+  const row = { id: d.id, user_id: u, rev: d.deleted ? 0 : (d.up_rev || 0), updated_at: d.updated_at, deleted: !!d.deleted, meta: await sealedMeta(d) };
+  const headers = { 'Content-Type': 'application/json', Prefer: 'return=representation' };
+  const r = d.seen ? await api('PATCH', '/rest/v1/sd_documents?select=synced_at&user_id=eq.' + u + '&id=eq.' + encodeURIComponent(d.id) + '&synced_at=eq.' + d.seen, { headers, body: JSON.stringify(row) })
+    : await api('POST', '/rest/v1/sd_documents?select=synced_at', { headers, body: JSON.stringify(row) });
+  if (r.status === 409) return false;
+  if (!r.ok) throw await httpError('Saving the list', r);
+  const out = await r.json(); if (!Array.isArray(out) || !out.length) return false;
+  d.seen = +out[0].synced_at || d.seen; d.row_rev = row.rev;
+  if (d.updated_at === row.updated_at) d.srv = d.updated_at;
+  if (!d.deleted) { d.pushed_rev = row.rev; d.pushed_tag = d.up_tag || ''; }
+  return true;
+}
+async function pullOne(d, u) {                                    // the cloud's entry for one document, applied here
+  const r = await api('GET', '/rest/v1/sd_documents?select=id,meta,rev,updated_at,deleted,synced_at&user_id=eq.' + u + '&id=eq.' + encodeURIComponent(d.id));
+  if (!r.ok) throw await httpError('Loading the entry', r);
+  const rows = await r.json(); if (rows.length) await applyRow(rows[0]); else d.seen = 0;
+}
 async function syncNow() {
   if (!SYNC || !session || !Vault.isOpen() || locked || passive) return;
   if (syncing) { syncAgain = true; return; }
-  syncing = true;
+  syncing = true; syncCtl = new AbortController();
+  const ctl = syncCtl;
   try {
     if (!(await ensureSession())) return;
     if (!(await ensureCloudKey())) return;
-    const u = session.uid, cursor = +localStorage.getItem(cursorKey()) || 0, from = Math.max(0, cursor - 3000);
-    const stop = () => !session || session.uid !== u || passive || locked;
+    const u = session.uid, stop = () => !session || session.uid !== u || passive || locked || !isOwner() || ctl.signal.aborted;
+    if (cursors[u] == null) { let old = 0; try { old = +localStorage.getItem(cursorKey()) || 0; localStorage.removeItem(cursorKey()); } catch (e) {} cursors[u] = old; }      // from a version that kept it outside the list
+    const cursor = cursors[u] || 0, from = Math.max(0, cursor - 3000);
     let maxSeen = cursor, unreadable = 0;
     for (let off = 0; ; off += 500) {                             // pull what changed since the last visit (small overlap: entries are idempotent)
       const r = await api('GET', '/rest/v1/sd_documents?select=id,meta,rev,updated_at,deleted,synced_at&synced_at=gt.' + from + '&order=synced_at.asc,id.asc&limit=500&offset=' + off);
@@ -213,47 +263,89 @@ async function syncNow() {
       for (const row of rows) { maxSeen = Math.max(maxSeen, +row.synced_at || 0); try { await applyRow(row); } catch (e) { unreadable++; } }
       if (rows.length < 500) break;
     }
+    if (stop()) return;
+    if (maxSeen > cursor) { cursors[u] = maxSeen; if (!(await persist())) { cursors[u] = cursor; throw new Error('The document list could not be saved.'); } }   // the bookmark moves only with the list
     let upFailed = 0, upWhy = '';
-    for (const d of docs.slice()) {                               // upload PDFs whose pages changed here; one failing document does not hold up the rest
+    for (const d of docs.slice()) {                               // upload the files of versions made here; one failing document does not hold up the rest
       if (stop()) return;
       if (d.deleted || d.rev_have !== d.rev || !d.pages.length || d.pages.some(p => p.status || p.local)) continue;
-      if (d.rev === d.pushed_rev && (d.rtag || '') === (d.pushed_tag || '')) continue;
+      if (!d.rtag) d.rtag = newTag();
+      if (d.rev === d.up_rev && d.rtag === (d.up_tag || '')) continue;
+      const f = upFail.get(d.id);
+      if (f && f.rev === d.rev && f.tag === d.rtag && Date.now() < f.until) { upFailed++; upWhy = f.why; continue; }      // refused before: tried again later, not on every pass
+      const rev = d.rev, tag = d.rtag;
       try {
+        if ((d.size || 0) + 4096 > MAX_FILE) throw new Error('"' + docLabel(d) + '" is larger than 50 MB and cannot be synced. Split it into smaller documents.');
         if (!(await ensureSession())) return;
         setSyncState('busy', 'Uploading ' + docLabel(d));
-        if (!d.rtag) d.rtag = newTag();
-        const rev = d.rev, tag = d.rtag, pdf = await getPdf(d);
-        const head = utf8(JSON.stringify({ rev, tag })), plain = new Uint8Array(4 + head.length + pdf.size);
+        const pdf = await getPdf(d);
+        if (stop()) return;
+        if (d.rev !== rev || d.rtag !== tag) continue;            // changed while the PDF was built: next pass
+        const head = utf8(JSON.stringify({ rev, tag }));
+        if (4 + head.length + pdf.size + 28 > MAX_FILE) throw new Error('"' + docLabel(d) + '" is larger than 50 MB and cannot be synced. Split it into smaller documents.');
+        const plain = new Uint8Array(4 + head.length + pdf.size);
         new DataView(plain.buffer).setUint32(0, head.length); plain.set(head, 4); plain.set(new Uint8Array(await pdf.arrayBuffer()), 4 + head.length);
-        if (plain.length + 28 > MAX_FILE) throw new Error('"' + docLabel(d) + '" is larger than 50 MB and cannot be synced. Split it into smaller documents.');
         const body = await Vault.cseal(plain, 'sd|file2|' + d.id);
-        const r = await api('POST', '/storage/v1/object/sd/' + u + '/' + d.id, { headers: { 'Content-Type': 'application/octet-stream', 'x-upsert': 'true' }, body });
-        if (!r.ok) throw await httpError('Uploading "' + docLabel(d) + '"', r);
-        d.pushed_rev = rev; d.pushed_tag = tag; persist();        // progress survives the app being closed
+        if (stop()) return;
+        const r = await api('POST', '/storage/v1/object/sd/' + objName(u, d, tag), { headers: { 'Content-Type': 'application/octet-stream' }, body });
+        let ok = r.ok;
+        if (!ok && (r.status === 409 || r.status === 400)) { const t = await r.text().catch(() => ''); ok = /exist|duplicate/i.test(t); }      // this version is up already (an earlier pass, or another window)
+        if (!ok) throw await httpError('Uploading "' + docLabel(d) + '"', r);
+        if (d.rev === rev && d.rtag === tag) { d.up_rev = rev; d.up_tag = tag; }
+        upFail.delete(d.id); persist();                           // progress survives the app being closed
       } catch (e) {
         upFailed++; upWhy = errText(e);
-        if (e instanceof TypeError || navigator.onLine === false) break;       // no connection: do not try the others now
+        if (e instanceof TypeError || navigator.onLine === false || ctl.signal.aborted) break;      // no connection: do not try the others now
+        const n = (f && f.rev === rev && f.tag === tag ? f.n : 0) + 1;
+        upFail.set(d.id, { rev, tag, n, why: upWhy, until: Date.now() + Math.min(3600000, 60000 * Math.pow(4, n - 1)) });
       }
     }
     if (stop()) return;
-    const dirty = docs.filter(d => (d.updated_at !== d.srv || d.pushed_rev > (d.row_rev || 0)) && (d.deleted ? (d.srv !== 0 || d.pushed_rev > 0) : d.pushed_rev > 0));
-    for (let i = 0; i < dirty.length; i += 100) {                 // push entries that changed here
-      const part = dirty.slice(i, i + 100), rows = [];
-      for (const d of part) rows.push({ id: d.id, user_id: u, rev: d.deleted ? 0 : (d.pushed_rev || 0), updated_at: d.updated_at, deleted: !!d.deleted, meta: await sealedMeta(d) });
-      const r = await api('POST', '/rest/v1/sd_documents?on_conflict=user_id,id', { headers: { 'Content-Type': 'application/json', Prefer: 'resolution=merge-duplicates,return=minimal' }, body: JSON.stringify(rows) });
-      if (!r.ok) throw await httpError('Saving the list', r);
-      part.forEach((d, k) => { d.row_rev = rows[k].rev; if (d.updated_at === rows[k].updated_at) d.srv = d.updated_at; });
+    let entryFailed = 0, entryWhy = '';
+    for (const d of docs.slice()) {                               // write the entries that changed here, each one conditionally; one entry that cannot be read does not hold up the rest
+      if (!entryDue(d)) continue;
+      if (stop()) return;
+      const wasTag = d.pushed_tag || '', wasRev = d.pushed_rev || 0, upTag = d.up_tag || '', upRev = d.up_rev || 0;
+      try {
+        let done = await writeEntry(d, u);
+        if (!done) {                                              // another device was first: take its entry, then try once more
+          await pullOne(d, u); if (stop()) return;
+          if (!d.deleted && upRev && (d.up_rev !== upRev || (d.up_tag || '') !== upTag) && !(upRev === d.pushed_rev && upTag === (d.pushed_tag || ''))) {
+            try { await api('DELETE', '/storage/v1/object/sd/' + objName(u, d, upTag)); } catch (e) {}      // the file this device sent belongs to the version that lost; its pages live on in the copy
+          }
+          if (entryDue(d)) done = await writeEntry(d, u);
+        }
+        if (done && !d.deleted && wasRev && (wasTag !== (d.pushed_tag || '') || wasRev !== d.pushed_rev)) {       // the file of the version before is no longer referenced
+          try { await api('DELETE', '/storage/v1/object/sd/' + objName(u, d, wasTag)); } catch (e) {}
+        }
+      } catch (e) {
+        entryFailed++; entryWhy = errText(e);
+        if (e instanceof TypeError || navigator.onLine === false || ctl.signal.aborted) break;
+      }
     }
     for (const d of docs) if (d.deleted && !d.cloudPurged && d.srv === d.updated_at) {     // the file of a deleted document goes too; counted as done only when the cloud confirms
+      if (stop()) return;
       try {
-        const r = await api('DELETE', '/storage/v1/object/sd/' + u + '/' + d.id);
-        let gone = r.ok || r.status === 404;
-        if (!gone && r.status === 400) gone = /not.?found/i.test(await r.text().catch(() => ''));
+        const c = await api('GET', '/rest/v1/sd_documents?select=updated_at,deleted&user_id=eq.' + u + '&id=eq.' + encodeURIComponent(d.id));
+        if (!c.ok) continue;
+        const cur = (await c.json())[0];
+        if (cur && (!cur.deleted || +cur.updated_at !== d.updated_at)) continue;      // the cloud moved on meanwhile: not ours to remove
+        let gone = true;
+        const names = [objName(u, d, d.pushed_tag || ''), objName(u, d, '')]; if (d.up_tag && d.up_tag !== d.pushed_tag) names.push(objName(u, d, d.up_tag));      // a file this device sent for a version that never got its entry
+        for (const name of names) {
+          if (stop()) return;
+          const r = await api('DELETE', '/storage/v1/object/sd/' + name);
+          let ok = r.ok || r.status === 404;
+          if (!ok && r.status === 400) ok = /not.?found/i.test(await r.text().catch(() => ''));
+          if (!ok) gone = false;
+        }
         if (gone) d.cloudPurged = true;
       } catch (e) {}
     }
-    localStorage.setItem(cursorKey(), String(maxSeen)); localStorage.setItem(okKey(), String(Date.now()));
-    persist(); renderAll();
+    if (stop()) return;
+    try { localStorage.setItem(okKey(), String(Date.now())); } catch (e) {}
+    if (!(await persist())) throw new Error('The document list could not be saved.');
+    renderAll();
     let failed = 0, why = '';
     for (const d of docs.slice()) {                               // download what is newer in the cloud
       if (stop()) return;
@@ -262,17 +354,19 @@ async function syncNow() {
     }
     if (unreadable) throw new Error(unreadable + (unreadable === 1 ? ' entry' : ' entries') + ' in the cloud cannot be opened with the key on this device.');
     if (upFailed) throw new Error(upFailed === 1 ? upWhy : upFailed + ' documents could not be uploaded. Last reason: ' + upWhy);
+    if (entryFailed) throw new Error(entryFailed === 1 ? entryWhy : entryFailed + ' entries could not be saved. Last reason: ' + entryWhy);
     if (failed) throw new Error('Could not download ' + failed + (failed === 1 ? ' document: ' : ' documents: ') + why);
     setSyncState('ok');
   } catch (e) {
-    if (session && !passive) setSyncState(navigator.onLine === false ? 'offline' : 'error', errText(e));
-  } finally { syncing = false; if (syncAgain) { syncAgain = false; scheduleSync(); } afterNav(); }
+    if (session && !passive && !ctl.signal.aborted) setSyncState(navigator.onLine === false ? 'offline' : 'error', errText(e));
+  } finally { syncing = false; if (syncCtl === ctl) syncCtl = null; if (syncAgain) { syncAgain = false; scheduleSync(); } afterNav(); }
 }
 async function downloadDoc(d, u) {
-  if (ed && curDoc === d) return;                                 // being edited right now: next round
+  if (ed && ed.doc === d) return;                                 // being edited right now: next round
   setSyncState('busy', 'Downloading ' + docLabel(d));
   const rev = d.rev, tag = d.rtag || '';
-  const r = await api('GET', '/storage/v1/object/authenticated/sd/' + u + '/' + d.id);
+  let r = await api('GET', '/storage/v1/object/authenticated/sd/' + objName(u, d, tag));
+  if (r.status === 404 && tag) r = await api('GET', '/storage/v1/object/authenticated/sd/' + objName(u, d, ''));      // written before version 4 of the format
   if (!r.ok) throw await httpError('Downloading "' + docLabel(d) + '"', r);
   const buf = await r.arrayBuffer();
   let plain, fileRev = rev, fileTag = tag;
@@ -288,11 +382,13 @@ async function downloadDoc(d, u) {
   if (!res.pages.length) throw new Error('the file holds no pages');
   const pages = [];
   for (const pg of res.pages) { const id = uid(); await pagePut(id, d.id, { jpeg: pg.jpeg, prev: pg.prev, orig: null, meta: { w: pg.w, h: pg.h, thumb: pg.thumb } }); pages.push({ id, w: pg.w, h: pg.h, size: pg.jpeg.size }); }
-  if (d.deleted || d.rev !== rev || (d.rtag || '') !== tag || !docs.includes(d)) { for (const p of pages) await idb.del('pages', p.id).catch(() => {}); return; }      // changed meanwhile
-  const old = d.pages, keep = old.filter(p => p.status || p.local);   // pages being scanned here right now stay and join the downloaded version
+  if (d.deleted || d.rev !== rev || (d.rtag || '') !== tag || !docs.includes(d) || passive) { for (const p of pages) await idb.del('pages', p.id).catch(() => {}); return; }      // changed meanwhile
+  // decided in one step, before anything is awaited: which pages stay (being scanned here right now) and which records go
+  const old = d.pages, keep = old.filter(p => p.status || p.local), gone = old.filter(p => !p.status && !p.local), before = sigOf(d);
   d.pages = pages.concat(keep); d.pageCount = pages.length; d.size = pages.reduce((a, p) => a + p.size, 0);
-  d.rev = fileRev; d.rtag = fileTag; d.rev_have = fileRev; d.pushed_rev = fileRev; d.pushed_tag = fileTag;
-  for (const p of old) if (!p.status && !p.local) { await idb.del('pages', p.id).catch(() => {}); dropPrev(p.id); }
+  d.rev = fileRev; d.rtag = fileTag; d.rev_have = fileRev; d.pushed_rev = fileRev; d.pushed_tag = fileTag; d.up_rev = fileRev; d.up_tag = fileTag;
+  if (snap[d.id] === before) snap[d.id] = sigOf(d);               // a version change nobody made here is not a change to send
+  for (const p of gone) { await idb.del('pages', p.id).catch(() => {}); dropPrev(p.id); }
   await thumbPut(d.id, res.pages[0].thumb);
   await idb.del('pdfs', d.id).catch(() => {});                    // the PDF is rebuilt here with this device's page size and the current name
   if (keep.some(p => p.local && !p.status)) { for (const p of d.pages) delete p.local; touchContent(d); save(); }
@@ -380,6 +476,6 @@ function renderSyncBox() {
       '<button id="syncBtn" class="btn">Sync now</button><button id="pwChange" class="btn quiet">Change encryption password</button>' + signOutBtn;
     $('pwChange').addEventListener('click', () => { keyNeed = 'change'; renderSyncBox(); });
   }
-  if ($('syncBtn')) $('syncBtn').addEventListener('click', () => { if (syncState === 'error') setSyncState(''); syncNow(); });
+  if ($('syncBtn')) $('syncBtn').addEventListener('click', syncRetry);
   if ($('signOut')) $('signOut').addEventListener('click', () => popup('Sign out on this device?', 'Your scans stay on this phone. They stop syncing until you sign in and enter your encryption password again.', [{ label: 'Sign out', fn: signOut }, { label: 'Stay signed in', cls: 'quiet' }]));
 }

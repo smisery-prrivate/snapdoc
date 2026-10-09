@@ -162,3 +162,31 @@ in version 5. Several of them were older than version 4 and had not been seen in
 | The Look step previewed the new look for pages rendered by an older version, and Done stored nothing. | Not applicable while the looks are switched off. To be handled when they return (a look version in the page record). |
 
 Tests: `t11-crop.js` holds each of these in place; the reviewers' own scripts were run against the fixes first.
+
+# Review round 2 (2026-10-09, versions 5 to 9)
+
+Independent reviewers read the whole app again (one lens each: encryption and lock, the two
+windows, sync, storage, camera and pages, offline and updates, the image arithmetic), and every
+finding was traced in the code by a second reviewer who answered only whether the defect exists.
+127 findings were confirmed (14 high, 42 medium, 71 low); 54 of them concern `app-sync.js`. The
+full list with the verdicts is in `_preview/review/r2-summary.json`.
+
+Version 10 fixes the sync group as one change of the sync format (format 4). The other groups
+are open and are being fixed next, each with a test.
+
+| Found (sync) | Changed in version 10 |
+| --- | --- |
+| The file of a document was overwritten in place (upsert). A device uploading its version replaced the file another device had just referenced in its entry; a download could then read a file that did not match the entry, and a lost race left a version with no file at all. | One file per version, named by document and version tag. Files are never overwritten; the file of the version before is removed only after the entry has moved on. Old file names are still read. |
+| Entries were upserted unconditionally. A late write from a stale pass (a slow device, a pass that was cut off) replaced a newer entry, and the device holding the newer state never noticed. | Entries are written conditionally against the server stamp the device last saw; the first entry is inserted, never upserted. A refused write takes in the cloud's entry and is tried once more. An older entry that lands late is pulled as "older than ours" and the newer state is sent again. |
+| The pull bookmark lived in `localStorage`, written before the list was stored. A list that failed to store, or a window closed in between, left the bookmark ahead of the list: those entries were never pulled again. | The bookmark is part of the encrypted list record and moves only in the same write; if the list cannot be stored the bookmark stays. `persist()` now reports whether the write landed. |
+| `pushed_rev` was set when the file upload succeeded, before the entry was accepted. A device that uploaded but whose entry write failed believed the version was synced. | Two separate marks: the file is up (`up_rev/up_tag`) and the entry is accepted (`pushed_rev/pushed_tag`). Only the second means synced. |
+| A document revived by a later change on another device kept its old marks: its pages were not downloaded, or the wrong file was deleted. A device that deleted a document while holding pages it had never sent lost those pages for good when the cloud brought the document back. | Revival adopts the cloud's version and downloads it. A later delete against a later rename: the renaming device's pages are the newest version and go up again. The cloud "going back" to an older version (a device that never saw ours) is handled either way. |
+| The files of a deleted document were removed before the cloud confirmed the delete marker was still current; a device that had revived the document meanwhile lost its file. The marker itself was rewritten on every pass. | The purge first reads the entry back and removes files only if the marker is still the current one. A marker is written once; a pass with nothing to do writes nothing. |
+| A refused upload (too large, a missing page, a cloud error) was tried again on every pass, every few seconds, for ever. | Refused uploads back off (1, 4, 16 ... minutes, at most an hour) per document and version; "Sync now" clears the back-off. |
+| A sync pass kept running after the window had lost the lock, been handed over to another window or been locked; a request in flight could still write. | Every step checks the window is still the active owner; the running request is cut off when another window takes over. |
+| The list of files that could not be removed was built after awaits and lost entries; a document edited during a download was overwritten. | The list is fixed before any await; a document in the editor is skipped and downloaded on the next pass. |
+| The format step reset what the device had agreed on with the cloud, so the other devices saw "both changed" and forked copies of every document. | The step keeps `pushed_rev/pushed_tag` and only re-sends the files; versions from before tags get the same tag everywhere. |
+| An entry that could not be read (sealed with another key, damaged) stopped the whole pass; the other documents were never written. | One entry that fails is counted and named; the rest of the pass continues. |
+| A version sent by the losing device of a "both changed" conflict stayed in the bucket for ever. | The loser's file is removed when its entry is refused; the pages live on in the copy. |
+
+Tests: `t14-sync4.js` holds each of these in place; `t2-sync.js` and `t6-syncfix.js` were run against the new format. The cloud mock refuses duplicate files without `x-upsert`, answers 409 on a duplicate insert and filters conditional updates by `synced_at`, like the real service.

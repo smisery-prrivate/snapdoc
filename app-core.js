@@ -2,7 +2,7 @@
 /* Snapdoc core: helpers, settings, encrypted storage, the document model, the processing
    queue, screens and the back button. The app is several plain script files that share one
    scope (no build step); index.html loads them in order. */
-const VERSION = 'v9';
+const VERSION = 'v10';
 const $ = id => document.getElementById(id);
 const IMG = self.SnapdocImaging;
 const CFG = self.APP_CONFIG || {};
@@ -147,46 +147,55 @@ async function resealAll() {
 }
 
 // ---------- documents: one encrypted list; page images live in their own records ----------
-let docs = [], snap = {}, foreignDirty = false, docsLoaded = false;
+let docs = [], snap = {}, foreignDirty = false, docsLoaded = false, cursors = {};      // cursors: sync bookmark per cloud account, stored with the list
 let curDoc = null, camDoc = null;
 const sigOf = d => JSON.stringify([d.name, !!d.deleted, d.rev || 0]);
 function migrate(d) {
   d.pages = Array.isArray(d.pages) ? d.pages : []; d.rev = d.rev || 0; d.rev_have = d.rev_have == null ? d.rev : d.rev_have; d.pushed_rev = d.pushed_rev || 0;
   d.created_at = d.created_at || Date.now(); d.updated_at = d.updated_at || d.created_at; d.srv = d.srv || 0; d.size = d.size || 0; d.name = d.name == null ? '' : String(d.name);
+  if (d.up_rev == null) { d.up_rev = d.pushed_rev; d.up_tag = d.pushed_tag || ''; }      // from before format 4: what was pushed had its file up
+  d.seen = d.seen || 0;
   return d;
 }
 // placeholders count as "in use" only while this instance is really processing something
 const isBusy = d => d === curDoc || d === camDoc || (qLen > 0 && d.pages.some(p => p.status));
 // this device holds the newest pages of the document (false while a newer version is still downloading)
 const hasContent = d => d.rev_have >= d.rev;
+const unpackList = v => Array.isArray(v) ? { docs: v, cursors: {} } : (v && Array.isArray(v.docs) ? { docs: v.docs, cursors: v.cursors || {} } : { docs: [], cursors: {} });
 async function loadDocs() {
-  const r = await idb.get('meta', 'docs'); let arr = [];
-  if (r) arr = await Vault.openJson(r.data, 'sd|docs');
-  docs = Array.isArray(arr) ? arr.map(migrate) : []; snap = {};
+  const r = await idb.get('meta', 'docs'); let v = null;
+  if (r) v = await Vault.openJson(r.data, 'sd|docs');
+  const u = unpackList(v);
+  docs = u.docs.map(migrate); cursors = u.cursors; snap = {};
   for (const d of docs) snap[d.id] = sigOf(d);
   docsLoaded = true;
 }
 async function mergeStored() {           // another tab wrote meanwhile: adopt what is newer there
-  let stored; try { const r = await idb.get('meta', 'docs'); if (!r) return; stored = await Vault.openJson(r.data, 'sd|docs'); } catch (e) { return; }
-  if (!Array.isArray(stored)) return;
-  for (const s of stored) {
+  let stored; try { const r = await idb.get('meta', 'docs'); if (!r) return; stored = unpackList(await Vault.openJson(r.data, 'sd|docs')); } catch (e) { return; }
+  for (const k in stored.cursors) cursors[k] = Math.max(cursors[k] || 0, stored.cursors[k] || 0);
+  for (const s of stored.docs) {
     migrate(s); const d = docs.find(x => x.id === s.id);
     if (!d || !isBusy(d)) s.pages = s.pages.filter(p => !p.status);              // never take over someone else's unfinished captures
     if (!d) { if (s.deleted || s.pages.length || s.rev) { docs.push(s); snap[s.id] = sigOf(s); } }
     else if (s.updated_at > d.updated_at && !isBusy(d)) { Object.assign(d, s); snap[s.id] = sigOf(s); }   // in place: running tasks keep their reference
   }
 }
-let persistChain = Promise.resolve(), persistQueued = false;
+// Resolves to true once the list (with every change made before the call) is stored, false when it
+// could not be stored or this window is not the active one. persistFailed stays set until a write lands.
+let persistChain = Promise.resolve(false), persistQueued = false, persistFailed = false;
 function persist() {
-  if (passive || persistQueued || !docsLoaded) return persistChain;      // never before the stored list has been read: an empty list must not replace it
+  if (passive || !docsLoaded) return Promise.resolve(false);      // never before the stored list has been read: an empty list must not replace it
+  if (persistQueued) return persistChain;                         // the queued write has not started yet, so it covers this change too
   persistQueued = true;
   persistChain = persistChain.then(async () => {
     persistQueued = false;
-    if (passive) return;
+    if (passive) return false;
     if (foreignDirty) { foreignDirty = false; await mergeStored(); }
-    await idb.put('meta', { id: 'docs', data: await Vault.sealJson(docs, 'sd|docs') });
+    await idb.put('meta', { id: 'docs', data: await Vault.sealJson({ docs, cursors }, 'sd|docs') });
+    persistFailed = false;
     try { localStorage.setItem(TICK_KEY, Date.now() + '.' + Math.random()); } catch (e) {}
-  }).catch(e => { persistQueued = false; if (!passive) toast('Saving failed: ' + errText(e)); });
+    return true;
+  }).catch(e => { persistQueued = false; persistFailed = true; if (!passive) toast('Saving failed: ' + errText(e)); return false; });
   return persistChain;
 }
 function save(opts) {

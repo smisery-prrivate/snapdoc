@@ -46,7 +46,7 @@ function showAway() {
   $('toast').classList.remove('show'); $('away').hidden = false;
 }
 function stopEverything() { try { stopCamera(); } catch (e) {} clearTimeout(syncTimer); }
-function instanceLost() { if (passive) return; passive = true; showAway(); stopEverything(); }
+function instanceLost() { if (passive) return; passive = true; showAway(); stopEverything(); abortSync(); }
 async function yieldInstance() {                    // another window takes over: finish what is in flight, then let go
   showAway();
   const t0 = Date.now(); let said = 0;
@@ -181,5 +181,5 @@ setInterval(() => { if (passive) return; renderSyncLine(); syncNow(); }, 60000);
 
 window.snapdocDebug = { get docs() { return docs; }, get session() { return session; }, get keyNeed() { return keyNeed; }, get syncState() { return syncState + (syncMsg ? ': ' + syncMsg : ''); },
   get busy() { return syncing || qLen > 0 || persistQueued; }, get passive() { return passive; }, get locked() { return locked; }, get updateReady() { return updateReady; },
-  syncNow, getPdf, idb, pageGet, Vault, relock, resealAll, housekeeping, get drive() { return drive; }, get driveState() { return driveState; }, driveNow, drivePending };
+  syncNow, syncRetry, getPdf, idb, pageGet, Vault, relock, resealAll, housekeeping, get drive() { return drive; }, get driveState() { return driveState; }, driveNow, drivePending };
 boot().catch(e => fatal('Unexpected error: ' + errText(e)));

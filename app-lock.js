@@ -3,7 +3,8 @@
 let locked = false, softLock = false, unlocking = false, hiddenAt = 0, holdReloadUntil = 0, pinStep = false, hideTimer = null, softTimer = null, storageAtRisk = false;
 const unlockWaiters = [];
 const COVERED = ['home', 'doc', 'edit', 'cam', 'sheet'];
-const workInFlight = () => qLen > 0 || syncing || Date.now() < holdReloadUntil || current() === 'edit' || (current() === 'cam' && camCount > 0) || edApplying || pdfBuilding;
+// shotsPending: the shutter has fired and the photo is not there yet. That shot is work in flight too.
+const workInFlight = () => shotsPending > 0 || qLen > 0 || syncing || Date.now() < holdReloadUntil || current() === 'edit' || (current() === 'cam' && camCount > 0) || edApplying || pdfBuilding;
 
 // ---------- lock screen ----------
 // soft = shown over a running app because work is still in flight; the page restarts (and the key
@@ -103,13 +104,13 @@ function renderSheet() {
   if (!stack.includes('sheet')) return;
   $('panel').innerHTML = '<div class="grab"></div><h2>Cloud sync</h2><div id="syncBox"></div><h2>App lock</h2><div id="lockBox"></div>' +
     '<h2>Scanning</h2>' +
-    '<div class="rowopt"><span>Default look</span><select id="setFilter"><option value="color">Color</option><option value="gray">Gray</option><option value="bw">Black &amp; white</option><option value="photo">Photo (no filter)</option></select></div>' +
+    (LOOKS ? '<div class="rowopt"><span>Default look</span><select id="setFilter"><option value="color">Color</option><option value="gray">Gray</option><option value="bw">Black &amp; white</option><option value="photo">Photo (no filter)</option></select></div>' : '') +
     '<div class="rowopt"><span>PDF page size</span><select id="setPage"><option value="A4">A4</option><option value="Letter">Letter</option><option value="fit">Fit the scan</option></select></div>' +
     '<h2>App</h2><div id="installBox"></div>' +
     '<div class="hint">Scans are encrypted on this device and encrypted again before they are uploaded. No cookies, no trackers, no third-party scripts.</div>' +
     '<div class="version">Snapdoc · ' + VERSION + '</div>';
   renderSyncBox(); renderLockBox(); renderInstallBox();
-  $('setFilter').value = settings.filter; $('setFilter').addEventListener('change', e => { settings.filter = e.target.value; saveSettings(); });
+  if (LOOKS) { $('setFilter').value = settings.filter; $('setFilter').addEventListener('change', e => { settings.filter = e.target.value; saveSettings(); }); }
   $('setPage').value = settings.pageSize; $('setPage').addEventListener('change', e => { settings.pageSize = e.target.value; saveSettings(); });
 }
 const LOCK_TEXT = {

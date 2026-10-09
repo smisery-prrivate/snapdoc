@@ -161,12 +161,18 @@
   .okbtn:active { background: var(--accent-dark); }
   .secondary:disabled { opacity: .45; }
   .hint.warn { color: var(--danger); }
-  /* the page that was just captured: large, at once, then it flies to the Done button */
+  /* the page that was just captured: large, at once, with a button to adjust its crop; then it flies to the Done button */
   #camPeek { position: absolute; inset: 0; z-index: 2; pointer-events: none; display: flex; flex-direction: column; align-items: center; justify-content: center; }
-  #camPeek img { display: block; width: auto; height: auto; max-width: 88%; max-height: 76%; border-radius: 8px; background: #fff; box-shadow: 0 12px 40px rgba(0,0,0,.6); border: 2px solid #2dd4bf; }
-  #camPeek span { display: inline-block; margin-top: 8px; background: rgba(0,0,0,.65); color: #fff; font-size: 13px; font-weight: 600; padding: 4px 12px; border-radius: 12px; }
-  #camPeek.go { animation: peek 1.5s cubic-bezier(.2,.8,.2,1) forwards; }
-  @keyframes peek { 0% { opacity: 0; transform: scale(.86); } 7% { opacity: 1; transform: scale(1); } 76% { opacity: 1; transform: scale(1); } 100% { opacity: 0; transform: translate(36%, 52%) scale(.12); } }
+  #camPeek img { display: block; width: auto; height: auto; max-width: 88%; max-height: 72%; border-radius: 8px; background: #fff; box-shadow: 0 12px 40px rgba(0,0,0,.6); border: 2px solid #2dd4bf; pointer-events: auto; }
+  #camPeek .pkrow { display: flex; align-items: center; gap: 10px; margin-top: 10px; }
+  #camPeek span { display: inline-block; background: rgba(0,0,0,.65); color: #fff; font-size: 13px; font-weight: 600; padding: 4px 12px; border-radius: 12px; }
+  #camPeekFix { height: 44px; padding: 0 18px; border: none; border-radius: 22px; background: #fff; color: #000; font-size: 15px; font-weight: 700; pointer-events: auto; box-shadow: 0 6px 20px rgba(0,0,0,.5); }
+  #camPeekFix:disabled { opacity: .7; }
+  #camPeek.go { animation: peek 2.2s cubic-bezier(.2,.8,.2,1) forwards; }      /* its length = PEEK_MS in app-cam.js */
+  @keyframes peek { 0% { opacity: 0; transform: scale(.86); } 5% { opacity: 1; transform: scale(1); } 84% { opacity: 1; transform: scale(1); } 100% { opacity: 0; transform: translate(36%, 52%) scale(.12); } }
+  /* "Adjust crop" on every page of the document */
+  .pfix { position: absolute; top: 8px; right: 8px; height: 40px; padding: 0 14px; border: none; border-radius: 20px; background: rgba(30,28,25,.8); color: #fff; font-size: 13px; font-weight: 700; }
+  .pfix:active { background: rgba(30,28,25,.95); }
   .pbadge { position: absolute; right: 8px; bottom: 8px; display: flex; align-items: center; gap: 7px; background: rgba(30,28,25,.74); color: #fff; font-size: 12px; font-weight: 600; padding: 5px 10px; border-radius: 12px; }
   .spin.sm { width: 14px; height: 14px; border-width: 2px; margin-right: 0; border-color: rgba(255,255,255,.35); border-top-color: #fff; }
   #away { position: fixed; inset: 0; z-index: 55; background: var(--bg); display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 14px; padding: 30px; text-align: center; }
@@ -248,7 +254,7 @@
     <canvas id="camOverlay"></canvas>
     <div id="camHint" hidden></div>
     <div id="camMsg" hidden></div>
-    <div id="camPeek" hidden><img id="camPeekImg" alt=""><span id="camPeekLbl"></span></div>
+    <div id="camPeek" hidden><img id="camPeekImg" alt=""><div class="pkrow"><span id="camPeekLbl"></span><button id="camPeekFix">Adjust crop</button></div></div>
     <div id="flashFx"></div>
   </div>
   <div class="cambot">

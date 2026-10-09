@@ -11,17 +11,22 @@ first). Working name, visible in `index.html`, `manifest.json` and `VERSION` in 
   open and counts pages; *Done* closes. *Auto* (on by default) takes the picture by itself once
   all four edges hold still for about a second, and arms again only when that page has really
   gone (the outline vanished, or what lies inside it changed). The moment a shot is taken, the
-  cropped, cleaned page pops up large and then lands on the Done button, so the crop is seen at
-  once. It is made from the live picture in a fraction of a second; the full-size photo is
-  worked on in the background and takes its place when it is ready. After a single shot the same
-  quick picture stands in for the page in the document, marked "Finishing".
-  The picture button imports photos from the library instead.
+  cropped page pops up large, with an **Adjust crop** button, and then lands on the Done button,
+  so the crop is seen at once and can be corrected at once. The pop-up is made from the live
+  picture in a fraction of a second; the full-size photo is worked on in the background and takes
+  its place when it is ready (if the photo turns out to be cut differently, the stored page is
+  shown again). After a single shot the same quick picture stands in for the page in the
+  document, marked "Finishing". The picture button imports photos from the library instead.
+- **The picture is not changed.** A page is the photo as it was taken, cut to the page and
+  straightened. No brightening, no filter. (Looks exist in the code and are switched off, see
+  "The look of a page".)
 - **Name.** A new document is called `YYYY-MM-DD ` with the cursor behind the space, keyboard open.
   An OK button next to the field saves the name and says so.
-- **Document view.** All pages one below the other. Tap a page for its tools: move up, move
-  down, rotate, crop (drag the four corners under a magnifier, then pick the look), delete with
-  undo. Deleting the only page asks to delete the document. Looks: Color, Gray, Black & white,
-  Photo. `+ Pages` adds more.
+- **Document view.** All pages one below the other. Every page carries an **Adjust crop**
+  button: one tap opens the photo with its four corners, drag them under a magnifier, Done. It
+  also works while the page is still marked "Finishing"; the corners then open as soon as the
+  page is there. Tap a page for its other tools: move up, move down, rotate, delete with undo.
+  Deleting the only page asks to delete the document. `+ Pages` adds more.
 - **Share PDF.** One PDF per document through the Android share sheet; on a PC it is saved as a
   file. `⋯` also offers save, rename and delete.
 - **Sync.** Optional. Sign in by e-mail link, choose an encryption password once, and every
@@ -30,8 +35,14 @@ first). Working name, visible in `index.html`, `manifest.json` and `VERSION` in 
 
 ## The look of a page
 
-A scan should look like a scan: white paper, dark print, nothing else changed. So the *Color*
-look removes only the lighting (`IMG.enhance` in `imaging.js`):
+**Switched off since v5** (`LOOKS = false` in `app-core.js`): the owner wants the picture exactly
+as taken, options may come later. With the switch off every page is stored with the look
+`photo`, the menu has no "Default look" and the editor has no Look step. Turning the switch on
+brings both back. A page that was scanned with a look in an earlier version keeps its picture
+until it is rotated or cropped again; then it is rendered from its original photo without a look.
+
+What the looks do when they are on: the *Color* look removes only the lighting (`IMG.enhance`
+in `imaging.js`):
 
 - It works out what blank paper looks like at every spot of the page: shadows, brightness that
   falls off toward one side, the tint of the lamp. A small copy of the page with everything thin
@@ -198,6 +209,8 @@ makes every device send what it holds once more in the new form.
   arrive as one unit.
 - v4: scans look like scans (the look removes only the lighting, see above); the cropped page
   appears at once and large after a shot.
+- v5: the picture is no longer changed at all (looks switched off); "Adjust crop" on the pop-up
+  after a shot and on every page; fixes for the findings of the review of v4 (see `REVIEW.md`).
 
 ## Tested, and not yet
 

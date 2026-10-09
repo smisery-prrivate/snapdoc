@@ -639,13 +639,14 @@
     },
     // Feedback right after a shot: the live picture of that moment, cut to the page and given its
     // look, in screen size. It is on screen while the full-size photo is still being taken and worked on.
-    // m: { bitmap (or a canvas), quad? (the outline the camera showed, in pixels of that picture), filter, maxOut }
+    // The page is searched for exactly as "process" does it (same search, same fallback to the whole
+    // picture), so the quick picture shows the crop the stored page will have whenever the photo
+    // shows what the live picture showed.
+    // m: { bitmap (or a canvas), quad? (the outline the camera showed; a hint only), filter, maxOut }
     async preview(m) {
       const src = IMG.drawCapped(m.bitmap, 1e9); if (m.bitmap.close) m.bitmap.close();
-      let quad = null;
-      try { const det = IMG.detectQuad(src, { size: 320, prior: m.quad || undefined }); if (det) quad = det.quad; } catch (e) {}      // searched again on this very picture, as the full-size photo will be
-      quad = quad || m.quad;
-      quad = quad ? IMG.insetQuad(quad, 0.012) : IMG.fullQuad(src.width, src.height);
+      let det = null; try { det = IMG.detectQuad(src, { prior: m.quad || undefined }); } catch (e) {}
+      const quad = det ? IMG.insetQuad(det.quad, 0.012) : IMG.fullQuad(src.width, src.height);
       const out = dress(IMG.warp(src, quad, { maxSide: m.maxOut || 900 }), m.filter, { work: 224 });
       return { jpeg: await IMG.toBlob(out, 'image/jpeg', 0.8), w: out.width, h: out.height };
     },

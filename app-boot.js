@@ -32,9 +32,14 @@ async function acquireInstance(force) {
   if (await holdInstance({ ifAvailable: true })) return true;
   if (!force && (await askHolder()) === true) return false;                 // another window is in use right now: let the user choose
   if (bc) bc.postMessage({ t: 'yield', from: INSTANCE_ID });                // ask it to finish and let go…
-  const ctl = new AbortController(), timer = setTimeout(() => ctl.abort(), 4000);
+  // …while it still has shots to finish it says "busy" once a second, and is given the time (a minute
+  // at most). A frozen background tab says nothing: after four silent seconds it is taken over.
+  const ctl = new AbortController(), t0 = Date.now(); let timer = setTimeout(() => ctl.abort(), 4000);
+  const onBusy = e => { if (e.data && e.data.t === 'busy' && Date.now() - t0 < 60000) { clearTimeout(timer); timer = setTimeout(() => ctl.abort(), 4000); } };
+  if (bc) bc.addEventListener('message', onBusy);
   const got = await holdInstance({ signal: ctl.signal }); clearTimeout(timer);
-  return got || holdInstance({ steal: true });                              // …a frozen background tab cannot answer: take over
+  if (bc) bc.removeEventListener('message', onBusy);
+  return got || holdInstance({ steal: true });
 }
 function showAway() {
   for (const id of COVERED) $(id).inert = true;
@@ -44,9 +49,17 @@ function stopEverything() { try { stopCamera(); } catch (e) {} clearTimeout(sync
 function instanceLost() { if (passive) return; passive = true; showAway(); stopEverything(); }
 async function yieldInstance() {                    // another window takes over: finish what is in flight, then let go
   showAway();
-  const t0 = Date.now();
+  const t0 = Date.now(); let said = 0;
   if (curDoc) { try { commitName(); } catch (e) {} }
-  while ((qLen > 0 || syncing || persistQueued) && Date.now() - t0 < 3000) await new Promise(r => setTimeout(r, 100));
+  try { stopCamera(); } catch (e) {}                 // no new shot from here on; one that is under way still lands in its document
+  // Shots that already flashed are finished first, however long that takes (up to the minute the
+  // other window grants): a page must not be thrown away because a second window was opened.
+  // Syncing and saving get three seconds, as before.
+  const shotsLeft = () => qLen > 0 || shotsPending > 0;
+  while ((shotsLeft() && Date.now() - t0 < 55000) || ((syncing || persistQueued) && Date.now() - t0 < 3000)) {
+    if (bc && shotsLeft() && Date.now() - said > 900) { said = Date.now(); bc.postMessage({ t: 'busy', from: INSTANCE_ID }); }
+    await new Promise(r => setTimeout(r, 100));
+  }
   try { await persistChain; } catch (e) {}
   passive = true; stopEverything();
   if (instanceRelease) { instanceRelease(); instanceRelease = null; }

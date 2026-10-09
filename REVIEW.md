@@ -138,3 +138,27 @@ Result: 57 findings reported, 57 confirmed as true in the code, none rejected. B
 | 57 | offline | low | `app-boot.js:29` | The answer to the request for lasting storage is thrown away, so the user never learns that the browser may delete the scans |
 
 Each fix has a test that first reproduces the defect: `t5-fixes.js`, `t6-syncfix.js`, `t7-update.js` in `_preview/tests`.
+
+# Review of version 4 (2026-10-09)
+
+Four independent reviewers read the change from version 3 to version 4, each through one lens: the
+order of events around a shot, readable pictures in memory, the arithmetic of the image code, and
+regressions. Each finding was then traced in the code by a second reviewer who had to answer only
+whether the defect exists, not how likely it is. The findings below were confirmed and are fixed
+in version 5. Several of them were older than version 4 and had not been seen in round 1.
+
+| Found | Changed in version 5 |
+| --- | --- |
+| Done, X or Back while the photo was still being taken stored a blank 2x2 pixel page in place of the shot (the still camera refuses the photo once the camera is closed, and the fallback then read an empty video). | The picture of the shutter moment is kept before anything is waited for and is used whenever the still camera fails, is too slow (6 s) or was closed. A camera without a picture takes no shot. |
+| A camera opened again on the same document was treated as the same session: pages of an import or of the opening before popped up in it, changed its Done picture, and a failing old page lowered its page count until the Done button disappeared. | Every opening of the camera has a number. Pop-up and Done picture belong to the newest shot of the current opening only; a failure lowers the count only for a page that opening counted. |
+| A photo that arrived after the camera was closed and opened again was taken into the new session (in single mode the camera just opened closed by itself). | The photo is compared with the opening it was shot in and goes to the document it was shot for. |
+| A shot whose photo was still being taken did not count as work in flight: a re-lock or an update restart reloaded the page and the shot was lost. | Pending shots count as work in flight for the lock and for updates. |
+| A second window taking over while pages were still being worked on threw those pages away after 3 seconds. | The window that steps back first finishes every shot and says so once a second; the new window waits for it (up to a minute) and only takes over a window that stays silent. |
+| An older page that finished late put its picture back on the Done button and could replace the pop-up of a newer shot. | Only the newest shot of the opening touches either. |
+| After Auto was switched off, a shot by hand was cut along the outline from the time Auto was on. | The outline is forgotten when Auto is switched off and when the camera restarts; a shot by hand uses the live outline. |
+| One failed outline request terminated the shared worker and left the quick picture that was in it unanswered for good. | A missing video frame no longer ends the worker; when the worker itself fails, everything that waits for it is answered. |
+| A page rotated or cropped within 2.5 s of being finished was first redrawn with its old quick picture. | The quick picture is given back whenever the page is rendered again. |
+| The pop-up and the stand-in could show another crop than the stored page, because the quick picture searched the outline with other settings and another fallback, and batch mode then never showed the stored crop. | The quick picture searches exactly like the full processing. If the finished page still has another shape (the photo can differ from the live picture), the stored page is shown again. |
+| The Look step previewed the new look for pages rendered by an older version, and Done stored nothing. | Not applicable while the looks are switched off. To be handled when they return (a look version in the page record). |
+
+Tests: `t11-crop.js` holds each of these in place; the reviewers' own scripts were run against the fixes first.

@@ -1,6 +1,6 @@
 'use strict';
 /* Snapdoc: the document list, the document view (all pages one below the other), PDF and sharing,
-   and the page editor (corners, look, rotation). */
+   and the page editor (the four corners; with LOOKS on also look and rotation). */
 
 // ---------- home ----------
 const rowBehind = d => d.updated_at !== d.srv || d.pushed_rev > (d.row_rev || 0);
@@ -36,6 +36,10 @@ let selPage = null; const pageUrls = new Map(), pendingDel = new Set();
 // live view at the moment of the shot. page id -> { url, w, h }; it lives in memory only.
 const quickPrev = new Map();
 function dropQuick(id) { const q = quickPrev.get(id); if (q) { quickPrev.delete(id); URL.revokeObjectURL(q.url); } }
+// Who waits for a page that is still being worked on (a tap on "Adjust crop" that came early).
+const pageWaiters = new Map(); let fixWait = null;
+const pageDone = id => new Promise(r => { const a = pageWaiters.get(id) || []; a.push(r); pageWaiters.set(id, a); });
+function pageSettled(id) { const a = pageWaiters.get(id); if (a) { pageWaiters.delete(id); for (const r of a) r(); } }
 const STILL_DOWNLOADING = 'This document is still downloading. Try again in a moment.';
 function openDoc(d, opts) {
   opts = opts || {}; curDoc = d; selPage = null;
@@ -88,12 +92,13 @@ function renderDoc() {
     const el = document.createElement('div'); el.className = 'page' + (selPage === p.id ? ' sel' : '');
     const qk = quickPrev.get(p.id), box = p.status ? qk : p;      // while a page is being worked on, its quick preview stands in
     const ratio = box && box.w && box.h ? ' style="aspect-ratio:' + (+box.w) + '/' + (+box.h) + '"' : '';
-    el.innerHTML = (p.status && !qk ? '<div class="pimg wait"><div class="spin"></div>Processing…</div>' : '<div class="pimg"' + ratio + '><img alt="Page ' + (i + 1) + '" decoding="async">' + (p.status ? '<div class="pbadge"><div class="spin sm"></div>Finishing</div>' : '') + '</div>') +
+    el.innerHTML = (p.status && !qk ? '<div class="pimg wait"><div class="spin"></div>Processing…</div>' : '<div class="pimg"' + ratio + '><img alt="Page ' + (i + 1) + '" decoding="async"><button class="pfix" aria-label="Adjust the crop of page ' + (i + 1) + '">' + (fixWait === p.id ? 'Opening…' : 'Adjust crop') + '</button>' + (p.status ? '<div class="pbadge"><div class="spin sm"></div>Finishing</div>' : '') + '</div>') +
       '<div class="pcap">Page ' + (i + 1) + ' of ' + d.pages.length + '</div>' +
       '<div class="ptools"><button data-a="up"' + (i === 0 ? ' disabled' : '') + '>↑</button><button data-a="down"' + (i === d.pages.length - 1 ? ' disabled' : '') + '>↓</button><button data-a="rot">Rotate</button><button data-a="edit">Crop</button><button data-a="del" class="del">Delete</button></div>';
     const img = el.querySelector('img');
     if (img) { if (qk) img.src = qk.url; if (!p.status) loadPrev(p.id, img); }      // the finished picture takes the place of the quick one without a blank moment
     el.querySelector('.pimg').addEventListener('click', () => { if (p.status) return; selPage = selPage === p.id ? null : p.id; renderDoc(); });
+    const fix = el.querySelector('.pfix'); if (fix) fix.addEventListener('click', e => { e.stopPropagation(); fixCrop(d, p); });
     el.querySelectorAll('.ptools button').forEach(b => b.addEventListener('click', () => pageAction(b.dataset.a, p)));
     list.appendChild(el);
   });
@@ -109,6 +114,20 @@ async function loadPrev(id, img) {
   img.src = u;
 }
 function dropPrev(id) { const u = pageUrls.get(id); if (u) { URL.revokeObjectURL(u); pageUrls.delete(id); } }
+// "Adjust crop", straight from the page. On a page that is still being worked on the tap is not
+// lost: the corners open as soon as the page is there.
+async function fixCrop(d, p) {
+  if (!d || fixWait || ed || edOpening) return;
+  if (!hasContent(d)) { toast(STILL_DOWNLOADING); return; }
+  if (p.status) {
+    fixWait = p.id; busy(true); if (current() === 'doc' && curDoc === d) renderDoc();
+    try { await pageDone(p.id); } finally { fixWait = null; busy(false); }
+    if (current() === 'doc' && curDoc === d) renderDoc();
+    if (!d.pages.includes(p) || p.status || d.deleted || locked || passive) return;
+    if (current() !== 'doc' || curDoc !== d) return;                 // left meanwhile
+  }
+  openEdit(p, d);
+}
 function confirmDeleteDoc(d, title) {
   popup(title || 'Delete this document?', 'All ' + d.pages.length + (d.pages.length === 1 ? ' page' : ' pages') + ' and the PDF are removed' + (SYNC && session ? ' here and in the cloud' : '') + '.', [
     // the change is recorded before the first wait, so a sync running at the same moment cannot swallow it
@@ -130,15 +149,16 @@ async function pageAction(a, p) {
         let r, meta;
         if (rec.orig) {             // re-render from the original photo: no quality loss however often it is turned
           const rot = ((rec.rot || 0) + 90) % 360;
-          r = await task({ cmd: 'process', blob: rec.orig, quad: rec.quad, filter: rec.filter || 'color', rot, keepOrig: false, maxOrig: 2800, maxOut: 2400 });
-          meta = { w: r.w, h: r.h, rot, thumb: r.thumb };
+          const look = lookOf(rec.filter);
+          r = await task({ cmd: 'process', blob: rec.orig, quad: rec.quad, filter: look, rot, keepOrig: false, maxOrig: 2800, maxOut: 2400 });
+          meta = { w: r.w, h: r.h, rot, filter: look, thumb: r.thumb };
         } else {
           const j = await pageGet(p.id, ['jpeg']);
           r = await task({ cmd: 'rotate', blob: j.jpeg, deg: 90 }); meta = { w: r.w, h: r.h, thumb: r.thumb };
         }
         if (d.deleted || d.pages.indexOf(p) < 0) return;
         await pagePut(p.id, d.id, { jpeg: r.jpeg, prev: r.prev, meta });
-        Object.assign(p, { w: r.w, h: r.h, size: r.jpeg.size }); dropPrev(p.id);
+        Object.assign(p, { w: r.w, h: r.h, size: r.jpeg.size }); dropPrev(p.id); dropQuick(p.id);
         touchContent(d); save(); if (curDoc === d) renderDoc();
       } catch (e) { toast('Rotate failed: ' + errText(e)); }
     }).then(() => busy(false));
@@ -232,11 +252,13 @@ async function sharePdf(d) {
 }
 $('shareBtn').addEventListener('click', () => { if (curDoc) { commitName(); sharePdf(curDoc); } });
 
-// ---------- page editor: corners first, then look and rotation ----------
+// ---------- page editor: the four corners (with LOOKS on: then look and rotation) ----------
+// It opens over the document view or over the camera (d: the document the page belongs to).
 let ed = null, edOpening = false, dragIdx = -1;
-async function openEdit(p) {
+async function openEdit(p, d) {
   if (ed || edOpening) return;
-  const d0 = curDoc; edOpening = true; busy(true);
+  d = d || curDoc; if (!d) return;
+  const from = current(); edOpening = true; busy(true);
   try {
     let rec = await pageGet(p.id, ['orig']); if (!rec) throw new Error('page data is missing');
     const hasOrig = !!rec.orig;
@@ -244,23 +266,24 @@ async function openEdit(p) {
     const blob = hasOrig ? rec.orig : rec.jpeg;
     const bmp = await createImageBitmap(blob);
     const srcCanvas = IMG.drawCapped(bmp, 2800); if (bmp.close) bmp.close();
-    if (curDoc !== d0 || current() !== 'doc' || !d0.pages.includes(p) || locked) return;     // left meanwhile
+    const here = current() === from && ((from === 'doc' && curDoc === d) || (from === 'cam' && camDoc === d));
+    if (!here || !d.pages.includes(p) || d.deleted || p.status || locked || passive) return;     // left meanwhile
     const full = IMG.fullQuad(srcCanvas.width, srcCanvas.height);
-    ed = { page: p, hasOrig, blob, srcCanvas, step: 'crop', warped: null, scale: 1,
+    ed = { doc: d, page: p, hasOrig, blob, srcCanvas, step: 'crop', warped: null, scale: 1,
       quad: (hasOrig && Array.isArray(rec.quad) ? rec.quad : full).map(c => c.slice()),
-      filter: hasOrig ? (rec.filter || 'color') : 'photo', rot: hasOrig ? (rec.rot || 0) : 0 };
+      filter: hasOrig ? lookOf(rec.filter) : 'photo', rot: hasOrig ? (rec.rot || 0) : 0 };
     ed.start = JSON.stringify([ed.quad, ed.filter, ed.rot]);
     push('edit'); renderEdit();
   } catch (e) { toast('Could not open the page: ' + errText(e)); } finally { edOpening = false; busy(false); }
 }
-function editCleanup() { ed = null; dragIdx = -1; }
+function editCleanup() { ed = null; dragIdx = -1; camAfterEdit(); }
 function renderEdit() {
   if (!ed) return;
   const crop = ed.step === 'crop';
   $('editTitle').textContent = crop ? 'Adjust corners' : 'Look';
   $('editAuto').hidden = !crop; $('cropCanvas').hidden = !crop; $('filterCanvas').hidden = crop;
   $('editBack').hidden = crop; $('editRotL').hidden = crop; $('editRotR').hidden = crop;
-  $('editNext').textContent = crop ? 'Next' : 'Done';
+  $('editNext').textContent = crop && LOOKS ? 'Next' : 'Done';
   const chips = $('editChips'); chips.innerHTML = '';
   const chip = (label, on, fn) => { const b = document.createElement('button'); b.textContent = label; if (on) b.className = 'on'; b.addEventListener('click', () => { if (ed) fn(); }); chips.appendChild(b); };
   if (crop) {
@@ -330,8 +353,8 @@ $('editRotR').addEventListener('click', () => { if (ed) { ed.rot = (ed.rot + 90)
 let edApplying = false;
 $('editNext').addEventListener('click', async () => {
   if (!ed || edApplying) return;
-  if (ed.step === 'crop') { ed.step = 'filter'; ed.warped = null; renderEdit(); return; }
-  const e0 = ed, d = curDoc;
+  if (ed.step === 'crop' && LOOKS) { ed.step = 'filter'; ed.warped = null; renderEdit(); return; }
+  const e0 = ed, d = e0.doc;
   if (!d || JSON.stringify([e0.quad, e0.filter, e0.rot]) === e0.start) { back(); return; }
   if (!hasContent(d)) { toast(STILL_DOWNLOADING); return; }
   edApplying = true; busy(true); $('editNext').disabled = true;
@@ -341,8 +364,9 @@ $('editNext').addEventListener('click', async () => {
     const meta = { w: r.w, h: r.h, thumb: r.thumb };
     if (e0.hasOrig) Object.assign(meta, { quad: e0.quad, filter: e0.filter, rot: e0.rot });
     await pagePut(e0.page.id, d.id, { jpeg: r.jpeg, prev: r.prev, meta });
-    Object.assign(e0.page, { w: r.w, h: r.h, size: r.jpeg.size }); dropPrev(e0.page.id);
+    Object.assign(e0.page, { w: r.w, h: r.h, size: r.jpeg.size }); dropPrev(e0.page.id); dropQuick(e0.page.id);
     touchContent(d); save();
+    if (camDoc === d && d.pages[d.pages.length - 1] === e0.page) $('doneThumb').src = r.thumb;      // the camera's Done button shows this page
     if (ed === e0) back(); else if (curDoc === d && current() === 'doc') renderDoc();      // left the editor meanwhile: stay where the user is
   } catch (e) { toast('Could not apply: ' + errText(e)); } finally { edApplying = false; busy(false); $('editNext').disabled = false; }
 });

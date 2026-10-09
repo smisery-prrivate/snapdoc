@@ -2,7 +2,7 @@
 /* Snapdoc core: helpers, settings, encrypted storage, the document model, the processing
    queue, screens and the back button. The app is several plain script files that share one
    scope (no build step); index.html loads them in order. */
-const VERSION = 'v4';
+const VERSION = 'v5';
 const $ = id => document.getElementById(id);
 const IMG = self.SnapdocImaging;
 const CFG = self.APP_CONFIG || {};
@@ -33,8 +33,15 @@ function writeGuard() {
 }
 
 // ---------- settings (not sensitive, plain) ----------
-let settings = { filter: 'color', pageSize: 'A4', lockAfter: 60, batch: false, auto: true };
+// The looks (Color, Gray, Black & white) are switched off: a scan is the photo as it was taken, cut
+// to the page and straightened, and nothing else is done to the picture. The code of the looks
+// stays in imaging.js. Setting this to true brings back "Default look" in the menu and the Look
+// step when a page is edited.
+const LOOKS = false;
+const lookOf = f => LOOKS ? (f || 'color') : 'photo';
+let settings = { filter: 'photo', pageSize: 'A4', lockAfter: 60, batch: false, auto: true };
 try { Object.assign(settings, JSON.parse(localStorage.getItem(SET_KEY) || '{}')); } catch (e) {}
+if (!LOOKS) settings.filter = 'photo';              // also for an install that had a look stored from an earlier version
 const saveSettings = () => { try { localStorage.setItem(SET_KEY, JSON.stringify(settings)); } catch (e) {} };
 
 // ---------- IndexedDB ----------

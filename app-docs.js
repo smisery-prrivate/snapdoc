@@ -32,6 +32,10 @@ $('menuBtn').addEventListener('click', () => openSheet());
 
 // ---------- document view ----------
 let selPage = null; const pageUrls = new Map(), pendingDel = new Set();
+// A page that is still being worked on already has a picture: the quick preview made from the
+// live view at the moment of the shot. page id -> { url, w, h }; it lives in memory only.
+const quickPrev = new Map();
+function dropQuick(id) { const q = quickPrev.get(id); if (q) { quickPrev.delete(id); URL.revokeObjectURL(q.url); } }
 const STILL_DOWNLOADING = 'This document is still downloading. Try again in a moment.';
 function openDoc(d, opts) {
   opts = opts || {}; curDoc = d; selPage = null;
@@ -82,11 +86,13 @@ function renderDoc() {
   }
   d.pages.forEach((p, i) => {
     const el = document.createElement('div'); el.className = 'page' + (selPage === p.id ? ' sel' : '');
-    const ratio = p.w && p.h ? ' style="aspect-ratio:' + (+p.w) + '/' + (+p.h) + '"' : '';
-    el.innerHTML = (p.status ? '<div class="pimg wait"><div class="spin"></div>Processing…</div>' : '<div class="pimg"' + ratio + '><img alt="Page ' + (i + 1) + '" decoding="async"></div>') +
+    const qk = quickPrev.get(p.id), box = p.status ? qk : p;      // while a page is being worked on, its quick preview stands in
+    const ratio = box && box.w && box.h ? ' style="aspect-ratio:' + (+box.w) + '/' + (+box.h) + '"' : '';
+    el.innerHTML = (p.status && !qk ? '<div class="pimg wait"><div class="spin"></div>Processing…</div>' : '<div class="pimg"' + ratio + '><img alt="Page ' + (i + 1) + '" decoding="async">' + (p.status ? '<div class="pbadge"><div class="spin sm"></div>Finishing</div>' : '') + '</div>') +
       '<div class="pcap">Page ' + (i + 1) + ' of ' + d.pages.length + '</div>' +
       '<div class="ptools"><button data-a="up"' + (i === 0 ? ' disabled' : '') + '>↑</button><button data-a="down"' + (i === d.pages.length - 1 ? ' disabled' : '') + '>↓</button><button data-a="rot">Rotate</button><button data-a="edit">Crop</button><button data-a="del" class="del">Delete</button></div>';
-    const img = el.querySelector('img'); if (img) loadPrev(p.id, img);
+    const img = el.querySelector('img');
+    if (img) { if (qk) img.src = qk.url; if (!p.status) loadPrev(p.id, img); }      // the finished picture takes the place of the quick one without a blank moment
     el.querySelector('.pimg').addEventListener('click', () => { if (p.status) return; selPage = selPage === p.id ? null : p.id; renderDoc(); });
     el.querySelectorAll('.ptools button').forEach(b => b.addEventListener('click', () => pageAction(b.dataset.a, p)));
     list.appendChild(el);
@@ -312,7 +318,7 @@ function drawFilter() {
   if (!ed || ed.step !== 'filter') return;
   if (!ed.warped) ed.warped = IMG.warp(ed.srcCanvas, ed.quad, { maxSide: 800 });
   let c = IMG.makeCanvas(ed.warped.width, ed.warped.height); c.getContext('2d', { willReadFrequently: true }).drawImage(ed.warped, 0, 0);
-  c = IMG.rotate(IMG.enhance(c, ed.filter), ed.rot);
+  c = IMG.rotate(IMG.enhance(c, ed.filter, { work: 224 }), ed.rot);      // the quick form of the look: this runs on every tap
   const cv = $('filterCanvas'); fitCanvas(cv, c.width, c.height);
   cv.getContext('2d').drawImage(c, 0, 0, cv.width, cv.height);
 }

@@ -161,11 +161,14 @@
   .okbtn:active { background: var(--accent-dark); }
   .secondary:disabled { opacity: .45; }
   .hint.warn { color: var(--danger); }
-  #camPeek { position: absolute; left: 50%; top: 50%; width: 62%; max-width: 300px; transform: translate(-50%, -50%); z-index: 2; pointer-events: none; text-align: center; }
-  #camPeek img { display: block; width: 100%; height: auto; max-height: 56vh; object-fit: contain; border-radius: 8px; background: #fff; box-shadow: 0 12px 40px rgba(0,0,0,.6); border: 2px solid #2dd4bf; }
+  /* the page that was just captured: large, at once, then it flies to the Done button */
+  #camPeek { position: absolute; inset: 0; z-index: 2; pointer-events: none; display: flex; flex-direction: column; align-items: center; justify-content: center; }
+  #camPeek img { display: block; width: auto; height: auto; max-width: 88%; max-height: 76%; border-radius: 8px; background: #fff; box-shadow: 0 12px 40px rgba(0,0,0,.6); border: 2px solid #2dd4bf; }
   #camPeek span { display: inline-block; margin-top: 8px; background: rgba(0,0,0,.65); color: #fff; font-size: 13px; font-weight: 600; padding: 4px 12px; border-radius: 12px; }
-  #camPeek.go { animation: peek 1.7s cubic-bezier(.2,.8,.2,1) forwards; }
-  @keyframes peek { 0% { opacity: 0; transform: translate(-50%, -50%) scale(.6); } 12% { opacity: 1; transform: translate(-50%, -50%) scale(1); } 70% { opacity: 1; transform: translate(-50%, -50%) scale(1); } 100% { opacity: 0; transform: translate(20%, 90%) scale(.18); } }
+  #camPeek.go { animation: peek 1.5s cubic-bezier(.2,.8,.2,1) forwards; }
+  @keyframes peek { 0% { opacity: 0; transform: scale(.86); } 7% { opacity: 1; transform: scale(1); } 76% { opacity: 1; transform: scale(1); } 100% { opacity: 0; transform: translate(36%, 52%) scale(.12); } }
+  .pbadge { position: absolute; right: 8px; bottom: 8px; display: flex; align-items: center; gap: 7px; background: rgba(30,28,25,.74); color: #fff; font-size: 12px; font-weight: 600; padding: 5px 10px; border-radius: 12px; }
+  .spin.sm { width: 14px; height: 14px; border-width: 2px; margin-right: 0; border-color: rgba(255,255,255,.35); border-top-color: #fff; }
   #away { position: fixed; inset: 0; z-index: 55; background: var(--bg); display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 14px; padding: 30px; text-align: center; }
   #away .logo { width: 84px; height: 84px; border-radius: 24px; background: var(--accent); color: #fff; display: flex; align-items: center; justify-content: center; font-size: 40px; margin-bottom: 8px; }
   #away h2 { font-size: 21px; max-width: 320px; }

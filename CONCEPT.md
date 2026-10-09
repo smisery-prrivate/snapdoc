@@ -10,8 +10,11 @@ first). Working name, visible in `index.html`, `manifest.json` and `VERSION` in 
   phone moves. *Single* takes one page and goes straight to the document. *Batch* keeps the camera
   open and counts pages; *Done* closes. *Auto* (on by default) takes the picture by itself once
   all four edges hold still for about a second, and arms again only when that page has really
-  gone (the outline vanished, or what lies inside it changed). After every shot the cropped,
-  cleaned page pops up for a moment and lands on the Done button, so the crop is seen at once.
+  gone (the outline vanished, or what lies inside it changed). The moment a shot is taken, the
+  cropped, cleaned page pops up large and then lands on the Done button, so the crop is seen at
+  once. It is made from the live picture in a fraction of a second; the full-size photo is
+  worked on in the background and takes its place when it is ready. After a single shot the same
+  quick picture stands in for the page in the document, marked "Finishing".
   The picture button imports photos from the library instead.
 - **Name.** A new document is called `YYYY-MM-DD ` with the cursor behind the space, keyboard open.
   An OK button next to the field saves the name and says so.
@@ -24,6 +27,28 @@ first). Working name, visible in `index.html`, `manifest.json` and `VERSION` in 
 - **Sync.** Optional. Sign in by e-mail link, choose an encryption password once, and every
   document appears on every device that signs in and knows the password.
 - **Lock.** Optional. Fingerprint or screen lock, or a password or long PIN.
+
+## The look of a page
+
+A scan should look like a scan: white paper, dark print, nothing else changed. So the *Color*
+look removes only the lighting (`IMG.enhance` in `imaging.js`):
+
+- It works out what blank paper looks like at every spot of the page: shadows, brightness that
+  falls off toward one side, the tint of the lamp. A small copy of the page with everything thin
+  and dark closed away (text, lines) gives that picture.
+- It does not trust that picture everywhere. A dark header, a photo, a filled table cell, a
+  tinted box or a bright spot inside a picture is content, not lighting. There the lighting is
+  filled in from the paper around it, so content is never brightened away.
+- The page is divided by that lighting. Near-white becomes white, which also removes paper grain
+  and sensor noise. The greys below are deepened a little, so pale print (a thermal receipt,
+  pencil) reads on white as it did on grey.
+- Clearly coloured paper keeps its colour, and light print on a dark sheet stays light. A faint
+  tint counts as the lamp and is removed.
+- A capture that is out of focus as a whole is recognised (there is content, but no pixel is
+  clearly darker than its surroundings) and is not bleached: its weak grey lines are kept.
+
+*Gray* does the same without colour, *Black & white* reduces the page to ink and paper, *Photo*
+changes nothing. `t10-look.js` holds this in place on a set of photographed-looking test pages.
 
 ## Encryption
 
@@ -171,13 +196,16 @@ makes every device send what it holds once more in the new form.
 - v3: fixes for all 57 findings of an independent review (see `REVIEW.md`), cropped-page preview
   after each shot, OK button for the name, smooth live outline, one active window, releases that
   arrive as one unit.
+- v4: scans look like scans (the look removes only the lighting, see above); the cropped page
+  appears at once and large after a shot.
 
 ## Tested, and not yet
 
 Tested in desktop Chrome with a simulated phone, a fake camera, a simulated fingerprint sensor
 and a stand-in for the cloud. The scripts are kept in `_preview/tests` (not published): run
 `gen_assets.py` once for the test photos and fake-camera file, install `puppeteer-core`, start
-the local server on port 8792, then the `t*.js` files and `test-detect.js`. Not yet tested on an
+the local server on port 8792, then the `t*.js` files and `test-detect.js` (`t10-look.js` uses
+the photographed-looking pages in `look/`). Not yet tested on an
 iPhone. The live outline and the automatic capture can only be judged on a real phone.
 
 ## Not built (Genius Scan has it)

@@ -1,10 +1,11 @@
 'use strict';
 /* Snapdoc camera: live edge overlay, single and batch mode, automatic capture when the page
-   holds still, import from the photo library. Captures are processed in the background and the
-   cropped result is shown briefly, so every shot gets visible feedback. */
+   holds still, import from the photo library. Every shot shows the cropped, cleaned page at once,
+   made from the live picture; the full-size photo is processed in the background. */
 let stream = null, track = null, imageCapture = null, camFromDoc = false, camCount = 0, liveTimer = null, torchOn = false, shooting = false, camGen = 0;
 let lastQuad = null, liveQuad = null, autoHold = null, holdSig = null, holdMissSince = 0, sigMissSince = 0, holdUntil = 0, anchorQuad = null, stableSince = 0, readyFrac = 0, wakeLock = null, peekTimer = null, peekUrl = '';
 let liveOn = false, rafId = 0, lastFrame = 0, shownQuad = null, targetQuad = null, quadAlpha = 0, readyShown = 0, lastSeenAt = 0, detWorker = null, detSeq = 0; const detPending = new Map();
+let peekShot = null, peekSeq = 0; const shots = new Map();      // shots: page id -> the shot it came from, while that page is being worked on
 
 function updateCamUI() {
   $('modeSingle').classList.toggle('on', !settings.batch); $('modeBatch').classList.toggle('on', settings.batch);
@@ -24,6 +25,7 @@ async function openCamera(doc) {
   lastQuad = null; liveQuad = null; autoHold = null; holdSig = null; holdUntil = 0; anchorQuad = null; readyFrac = 0;
   $('doneThumb').hidden = true; $('camMsg').hidden = true; $('shutter').disabled = false; setHint(''); hidePeek();
   push('cam'); updateCamUI();
+  startDetWorker();                                  // it warms up while the camera starts
   await startStream();
 }
 // also called when the app comes back to the front and the phone had taken the camera away
@@ -78,6 +80,7 @@ function startDetWorker() {
     detWorker = new Worker('worker.js');
     detWorker.onmessage = e => { const p = detPending.get(e.data.id); if (!p) return; detPending.delete(e.data.id); if (e.data.ok) p.res(e.data); else p.rej(new Error(e.data.error)); };
     detWorker.onerror = () => { for (const p of detPending.values()) p.rej(new Error('worker failed')); detPending.clear(); detWorker = null; };
+    detWorker.postMessage({ id: 0, cmd: 'warm' });     // a dry run of the quick preview, so the first real one is fast
   } catch (e) { detWorker = null; }
 }
 function startLive() {
@@ -195,34 +198,79 @@ function quickThumb(v, quad) {
     return IMG.warp(small, quad.map(p => [p[0] * k, p[1] * k]), { maxSide: 140 }).toDataURL('image/jpeg', 0.7);
   } catch (e) { return null; }
 }
+// ---------- the page at once ----------
+// The moment the shutter fires, the live picture of that moment is cut to the page and given its
+// look, in the worker that otherwise looks for the outline. That takes a fraction of a second, so
+// the cropped page is on screen while the full-size photo is still being taken and worked on.
+// quad: the outline the camera showed, in video pixels. Resolves to { jpeg, w, h } or null.
+async function quickPreview(v, quad) {
+  const vw = v.videoWidth, vh = v.videoHeight; if (!vw || !vh) return null;
+  const k = Math.min(1, 1280 / Math.max(vw, vh)), msg = { cmd: 'preview', quad: quad ? quad.map(p => [p[0] * k, p[1] * k]) : null, filter: settings.filter, maxOut: 900 };
+  try {
+    if (detWorker) {
+      const bmp = await createImageBitmap(v, { resizeWidth: Math.max(1, Math.round(vw * k)), resizeHeight: Math.max(1, Math.round(vh * k)), resizeQuality: 'medium' });
+      const w = detWorker; if (!w) { if (bmp.close) bmp.close(); return null; }
+      const id = ++detSeq;
+      return await new Promise((ok, no) => { detPending.set(id, { res: ok, rej: no }); w.postMessage(Object.assign({ id, bitmap: bmp }, msg), [bmp]); });
+    }
+    const still = IMG.drawCapped(v, 1280);             // no worker: keep this moment, work on it once the flash has been drawn
+    await new Promise(r => setTimeout(r, 50));
+    return await IMG.tasks.preview(Object.assign({ bitmap: still }, msg));
+  } catch (e) { return null; }
+}
+// A shot: { gen, label, quick: { url, w, h } once the quick picture is there, pageId and doc once
+// the photo is there, shown: its picture was on screen, dead: the photo failed, done: its page is finished }
+function shotQuickReady(shot, r) {
+  if (!r || !r.jpeg || shot.dead || shot.done) return;           // the photo failed, or its page is finished already
+  shot.quick = { url: URL.createObjectURL(r.jpeg), w: r.w, h: r.h };
+  if (current() === 'cam' && camGen === shot.gen && !locked) showPeek(shot.quick.url, shot.label, shot, false);
+  attachQuick(shot);
+}
+// The page of a shot gets the quick picture as its stand-in as soon as both exist.
+function attachQuick(shot) {
+  if (!shot.quick || !shot.pageId || shot.attached) return;
+  shot.attached = true;
+  const d = shot.doc, p = d && !d.deleted ? d.pages.find(x => x.id === shot.pageId) : null;
+  if (!p || !p.status) { const u = shot.quick.url; setTimeout(() => URL.revokeObjectURL(u), 4000); return; }     // that page is finished or gone already
+  quickPrev.set(shot.pageId, shot.quick);
+  if (current() === 'doc' && curDoc === d) renderDoc();
+}
+function killShot(shot) {
+  shot.dead = true; if (peekShot === shot) hidePeek();
+  if (shot.quick && !shot.attached) { shot.attached = true; URL.revokeObjectURL(shot.quick.url); }
+}
 async function shoot() {
   if (shooting || !stream || locked) return; shooting = true;
   const d0 = camDoc, v = $('video'), quad0 = lastQuad;
   autoHold = quad0; holdSig = quad0 ? pageSig(v, quad0) : null; holdUntil = quad0 ? 0 : performance.now() + 3000; holdMissSince = 0; sigMissSince = 0; anchorQuad = null; readyFrac = 0;
   const fx = $('flashFx'); fx.classList.remove('on'); void fx.offsetWidth; fx.classList.add('on');
   const thumb = quickThumb(v, quad0 || liveQuad);
+  const shot = { gen: camGen, label: 'Page ' + ((d0 ? d0.pages.length : 0) + 1), quick: null, pageId: null, doc: null, shown: false, dead: false, attached: false };
+  quickPreview(v, quad0 || liveQuad).then(r => shotQuickReady(shot, r));
   let blob = null; try { blob = await takePhotoBlob(); } catch (e) {}
   shooting = false;
-  if (!blob) { toast('Could not take the photo.'); return; }
-  if (current() !== 'cam' || camDoc !== d0) { lateCapture(blob, d0); return; }      // Done, X or Back was pressed while the photo was being taken
-  addCapture(blob, thumb, false);
+  if (!blob) { killShot(shot); toast('Could not take the photo.'); return; }
+  if (current() !== 'cam' || camDoc !== d0) { lateCapture(blob, d0, shot); return; }      // Done, X or Back was pressed while the photo was being taken
+  addCapture(blob, thumb, false, shot);
 }
 // A shot that already flashed is never thrown away: it goes into the document the camera was
 // working on, or into a new one.
-function lateCapture(blob, d0) {
+function lateCapture(blob, d0, shot) {
   let d = d0 && docs.includes(d0) && !d0.deleted ? d0 : null;
   if (!d) d = newDoc();
   const pageId = uid();
   d.pages.push({ id: pageId, status: 'processing' }); save({ sync: false });
+  if (shot) { shot.pageId = pageId; shot.doc = d; shots.set(pageId, shot); attachQuick(shot); }
   queue(() => processNew(d, pageId, blob)); renderAll();
   toast('The last shot was added to ' + ((d.name || '').trim() || 'a new document') + '.');
 }
 // A capture becomes a placeholder page at once; the worker fills it in.
-function addCapture(blob, thumb, stay) {
+function addCapture(blob, thumb, stay, shot) {
   if (!camDoc) camDoc = newDoc();
   else if (!docs.includes(camDoc)) { docs.unshift(camDoc); snap[camDoc.id] = sigOf(camDoc); }      // dropped after a failed first page: take it back
   const d = camDoc, pageId = uid();
   d.pages.push({ id: pageId, status: 'processing' }); camCount++;
+  if (shot) { shot.pageId = pageId; shot.doc = d; shots.set(pageId, shot); attachQuick(shot); }
   save({ sync: false });
   queue(() => processNew(d, pageId, blob));
   if (thumb) { $('doneThumb').src = thumb; $('doneThumb').hidden = false; }
@@ -239,8 +287,10 @@ function dropEmptyDoc(d) {
   if (curDoc === d && current() === 'doc') back();
 }
 async function processNew(d, pageId, blob) {
+  const forget = () => { const s = shots.get(pageId); shots.delete(pageId); if (s) killShot(s); dropQuick(pageId); };
   const fail = () => {                                // nothing half-done stays behind, whatever step failed
     const i = d.pages.findIndex(x => x.id === pageId); if (i >= 0) d.pages.splice(i, 1);
+    forget();
     idb.del('pages', pageId).catch(() => {});
     if (d === camDoc) { camCount = Math.max(0, camCount - 1); updateCamUI(); }
     if (!d.pages.length && !d.rev && d !== camDoc) dropEmptyDoc(d);
@@ -250,29 +300,50 @@ async function processNew(d, pageId, blob) {
   try { r = await task({ cmd: 'process', blob, filter: settings.filter, keepOrig: true, maxOrig: 2800, maxOut: 2400 }); }
   catch (e) { fail(); throw e; }
   const p = d.pages.find(x => x.id === pageId);
-  if (!p || d.deleted) return;                                  // removed while it was processing
+  if (!p || d.deleted) { forget(); return; }                    // removed while it was processing
   try { await pagePut(pageId, d.id, { jpeg: r.jpeg, prev: r.prev, orig: r.orig, meta: { quad: r.quad, w: r.w, h: r.h, origW: r.origW, origH: r.origH, filter: settings.filter, rot: 0, thumb: r.thumb } }); }
   catch (e) { fail(); throw e; }
   Object.assign(p, { w: r.w, h: r.h, size: r.jpeg.size, o: 1 }); delete p.status;
   if (!docs.includes(d) && !d.deleted) { docs.unshift(d); snap[d.id] = sigOf(d); }
   if (hasContent(d)) { touchContent(d); save(); }
   else { p.local = 1; save({ sync: false }); syncNow(); }        // a newer version is still downloading: this page is added to it once it is here
-  renderAll(); showPeek(d, r);
+  const shot = shots.get(pageId); shots.delete(pageId); if (shot) shot.done = true;
+  renderAll(); showFinished(d, r, shot);
+  setTimeout(() => dropQuick(pageId), 2500);                    // by then the finished picture stands where the quick one stood
 }
-// feedback after each shot: the cropped, cleaned page pops up for a moment and lands on the Done button
-function showPeek(d, r) {
+// The finished page of a shot. Its quick picture was shown at the moment of the shot; if that is
+// still up, the finished one takes its place quietly. Only a shot that never got a quick picture
+// (an old browser, an import) gets its pop-up now.
+function showFinished(d, r, shot) {
   if (current() !== 'cam' || camDoc !== d || locked) return;
   $('doneThumb').src = r.thumb; $('doneThumb').hidden = false;
+  if (shot && shot.shown) {
+    if (peekShot === shot && !$('camPeek').hidden) { if (peekUrl) URL.revokeObjectURL(peekUrl); peekUrl = URL.createObjectURL(r.prev); $('camPeekImg').src = peekUrl; }
+    return;
+  }
+  showPeek(URL.createObjectURL(r.prev), 'Page ' + d.pages.filter(x => !x.status).length, shot || null, true);
+}
+// feedback after each shot: the cropped, cleaned page pops up large for a moment and lands on the
+// Done button. owned: the address belongs to the pop-up and is given back when it closes.
+function showPeek(url, label, shot, owned) {
   hidePeek();
-  const el = $('camPeek'), img = $('camPeekImg');
-  peekUrl = URL.createObjectURL(r.prev); img.src = peekUrl;
-  $('camPeekLbl').textContent = 'Page ' + d.pages.filter(x => !x.status).length;
-  el.hidden = false; el.classList.remove('go'); void el.offsetWidth; el.classList.add('go');
-  peekTimer = setTimeout(hidePeek, 1700);
+  const el = $('camPeek'), img = $('camPeekImg'), my = peekSeq;
+  if (owned) peekUrl = url;
+  peekShot = shot;
+  $('camPeekLbl').textContent = label;
+  img.onload = () => {                                 // only once the picture is really there: never the previous page for a blink
+    if (my !== peekSeq || !el.hidden) return;
+    if (shot) shot.shown = true;
+    el.hidden = false; el.classList.remove('go'); void el.offsetWidth; el.classList.add('go');
+    peekTimer = setTimeout(hidePeek, 1500);
+  };
+  img.onerror = () => { if (my === peekSeq) hidePeek(); };
+  img.src = url;
 }
 function hidePeek() {
-  clearTimeout(peekTimer); peekTimer = null;
-  const el = $('camPeek'); el.hidden = true; el.classList.remove('go');
+  clearTimeout(peekTimer); peekTimer = null; peekShot = null; peekSeq++;
+  const el = $('camPeek'), img = $('camPeekImg'); el.hidden = true; el.classList.remove('go');
+  img.onload = img.onerror = null; img.removeAttribute('src');
   if (peekUrl) { URL.revokeObjectURL(peekUrl); peekUrl = ''; }
 }
 function pickPhotos() { holdReloadUntil = Date.now() + 600000; $('importInput').click(); }   // the picker hides the app; do not restart it on return

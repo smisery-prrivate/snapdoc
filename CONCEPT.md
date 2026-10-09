@@ -35,6 +35,17 @@ first). Working name, visible in `index.html`, `manifest.json` and `VERSION` in 
 - **Sync.** Optional. Sign in by e-mail link, choose an encryption password once, and every
   document appears on every device that signs in and knows the password.
 - **Lock.** Optional. Fingerprint or screen lock, or a password or long PIN.
+- **Google Drive copies.** Optional (`app-drive.js`, needs `googleClientId` in `config.js`). Once
+  a Google account is connected in the menu, every document is kept as a plain PDF in a folder
+  "Snapdoc" of that account: uploaded from the device right after a scan, renamed and replaced
+  after a rename or a page change, moved to the Drive bin when the document is deleted. The PDFs
+  are readable in Drive on purpose; the way there is HTTPS. The app asks Google only for the files
+  it created itself (scope `drive.file`) and loads no Google script: the sign-in is a redirect to
+  Google and back, with a one-time token in the address that is cleaned at once. The access token
+  lives one hour and is stored encrypted; when it has run out and something is waiting, the app
+  reconnects by itself through a redirect without a screen (never with a lock on: then the menu
+  and the status line ask for a tap). Each file carries the document id, so a second device that
+  is also connected finds the file instead of creating it twice.
 
 ## The look of a page
 
@@ -198,6 +209,17 @@ of two versions.
 - If the browser does not promise to keep the stored data, the menu says so while scans exist
   only on this device.
 
+## Set-up of the Google Drive copies (once, by the owner)
+
+1. In the Google Cloud Console create a project, enable the "Google Drive API".
+2. OAuth consent screen: external, app name Snapdoc, scope `.../auth/drive.file`. While the app
+   is in "Testing", every user has to be listed as a test user; "Publish" lifts that (no review
+   is needed for this scope).
+3. Credentials: OAuth client ID, type "Web application", authorised JavaScript origin
+   `https://smisery-prrivate.github.io`, authorised redirect URI
+   `https://smisery-prrivate.github.io/snapdoc/`.
+4. Put the client id into `googleClientId` in `config.js`.
+
 ## Set-up (once)
 
 Snapdoc has its **own Supabase project**, not shared with Brain Relieve or Stillzeit (Pat's
@@ -232,6 +254,7 @@ makes every device send what it holds once more in the new form.
   after a shot and on every page; fixes for the findings of the review of v4 (see `REVIEW.md`).
 - v6: new page detector (see "Finding the page"). Not independently reviewed yet.
 - v7: search field and pick mode on the home list (share or save several PDFs at once).
+- v8: Google Drive copies (plain PDFs in the user's own Drive, uploaded from the device).
 
 ## Tested, and not yet
 

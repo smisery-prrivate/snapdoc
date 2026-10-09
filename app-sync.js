@@ -319,6 +319,7 @@ function lastOkLabel() {
 }
 function renderSyncLine() {
   const el = $('syncline'); el.className = 'subline';
+  if (drive && driveState === 'reconnect' && drivePending().length) { el.className = 'subline err'; el.textContent = 'Google Drive needs a tap to reconnect · tap here'; return; }
   if (!SYNC) { el.textContent = 'Encrypted on this device'; return; }
   if (!session) { el.textContent = 'Encrypted on this device · tap to add cloud sync'; return; }
   if (!Vault.hasCloudKey(session.uid)) {

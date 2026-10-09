@@ -96,11 +96,12 @@ function afterNav() {
 async function boot() {
   const vt = $('vtag'); if (vt) vt.textContent = VERSION;
   // a sign-in link returns with tokens (or an error) in the URL fragment; take them and clean the address at once
-  let tokens = null, linkMsg = '';
+  let tokens = null, linkMsg = '', driveQp = null;
   const h = location.hash || '';
   try {
     const qp = new URLSearchParams(h.slice(1));
-    if (qp.get('access_token') && qp.get('refresh_token')) tokens = { access_token: qp.get('access_token'), refresh_token: qp.get('refresh_token') };
+    if ((qp.get('state') || '').startsWith(DRIVE_STATE + '.')) driveQp = qp;                       // back from Google (Drive copies)
+    else if (qp.get('access_token') && qp.get('refresh_token')) tokens = { access_token: qp.get('access_token'), refresh_token: qp.get('refresh_token') };
     else if (qp.get('error') || qp.get('error_code')) linkMsg = qp.get('error_code') === 'otp_expired' ? 'This sign-in link has expired or was already used. Request a new one in the menu.'
       : 'The sign-in link could not be used' + (qp.get('error_description') ? ': ' + qp.get('error_description').replace(/\+/g, ' ') : '.');
   } catch (e) {}
@@ -115,7 +116,8 @@ async function boot() {
   try { state = await Vault.load(metaStore); } catch (e) { fatal('The storage of this browser could not be opened (' + errText(e) + '). Private windows and blocked site data prevent it.'); return; }
   if (state === 'locked') { showLock(false); await whenUnlocked(); }
   try { await loadDocs(); } catch (e) { fatal('The stored documents could not be read (' + errText(e) + ').'); return; }
-  await loadSession(); syncFormatCheck();
+  await loadSession(); syncFormatCheck(); await loadDrive();
+  let driveMsgBoot = ''; if (driveQp) { try { driveMsgBoot = await driveAdopt(driveQp); } catch (e) { driveMsgBoot = 'Google Drive was not connected: ' + errText(e); } }
   if (tokens) { try { linkMsg = await adoptLink(tokens); } catch (e) { linkMsg = 'The sign-in link could not be used.'; } }
 
   // captures that never finished (app closed while processing) leave nothing behind
@@ -130,11 +132,14 @@ async function boot() {
   else storageAtRisk = true;
   renderAll();
   if (linkMsg) popup('Sign-in link', linkMsg, [{ label: 'OK', cls: 'primary' }]);
+  if (driveMsgBoot) popup('Google Drive', driveMsgBoot, [{ label: 'OK', cls: 'primary' }]);
+  else if (driveQp && drive) toast('Google Drive connected as ' + (drive.email || 'your account'));
 
   let resume = ''; try { resume = sessionStorage.getItem(RESUME_KEY) || ''; sessionStorage.removeItem(RESUME_KEY); } catch (e) {}
   const rd = resume && byId(resume); if (rd && !rd.deleted && !linkMsg) openDoc(rd);
 
   if (session) syncNow().then(() => { if (tokens && !linkMsg && (keyNeed === 'create' || keyNeed === 'enter')) openSheet(); });
+  scheduleDrive(driveQp ? 0 : 4000);
   setTimeout(resealAll, 3000); setTimeout(housekeeping, 8000);
   registerSW();
 }
@@ -176,5 +181,5 @@ setInterval(() => { if (passive) return; renderSyncLine(); syncNow(); }, 60000);
 
 window.snapdocDebug = { get docs() { return docs; }, get session() { return session; }, get keyNeed() { return keyNeed; }, get syncState() { return syncState + (syncMsg ? ': ' + syncMsg : ''); },
   get busy() { return syncing || qLen > 0 || persistQueued; }, get passive() { return passive; }, get locked() { return locked; }, get updateReady() { return updateReady; },
-  syncNow, getPdf, idb, pageGet, Vault, relock, resealAll, housekeeping };
+  syncNow, getPdf, idb, pageGet, Vault, relock, resealAll, housekeeping, get drive() { return drive; }, get driveState() { return driveState; }, driveNow, drivePending };
 boot().catch(e => fatal('Unexpected error: ' + errText(e)));

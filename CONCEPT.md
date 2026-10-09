@@ -61,6 +61,22 @@ in `imaging.js`):
 *Gray* does the same without colour, *Black & white* reduces the page to ink and paper, *Photo*
 changes nothing. `t10-look.js` holds this in place on a set of photographed-looking test pages.
 
+## Finding the page
+
+`IMG.detectQuad` in `imaging.js` finds the four corners of the sheet, for the live outline, for
+the quick picture after a shot and for the stored page. It works on a small copy of the picture:
+the brightness and colour steps give two edge maps, the regions between the edges are outlined,
+the outlines are simplified into straight runs, and four runs at a time are tried as the sides
+of the page. Every candidate is scored by how much of each side really is an edge and whether
+the sides meet at the corners; if none is convincing, nothing is returned (the whole photo is
+then kept and the crop can be set by hand). The outline of the frame before is taken as a hint,
+which keeps the live outline calm.
+
+It replaced the first detector in v6. On 160 made-up phone photos with known corners (tools and
+figures in `_preview/review/detbench`, not published) the first detector found the page in
+about one picture out of three, this one in nine out of ten, with no outline shown on pictures
+without a page. The figures come from made-up pictures; real photos are the test that counts.
+
 ## Encryption
 
 Everything is encrypted with AES-256-GCM, all in `vault.js` (WebCrypto, no libraries).
@@ -211,6 +227,7 @@ makes every device send what it holds once more in the new form.
   appears at once and large after a shot.
 - v5: the picture is no longer changed at all (looks switched off); "Adjust crop" on the pop-up
   after a shot and on every page; fixes for the findings of the review of v4 (see `REVIEW.md`).
+- v6: new page detector (see "Finding the page"). Not independently reviewed yet.
 
 ## Tested, and not yet
 

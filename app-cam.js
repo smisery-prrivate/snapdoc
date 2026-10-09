@@ -1,8 +1,10 @@
 'use strict';
 /* Snapdoc camera: live edge overlay, single and batch mode, automatic capture when the page
-   holds still, import from the photo library. Captures are processed in the background. */
-let stream = null, track = null, imageCapture = null, camFromDoc = false, camCount = 0, liveTimer = null, torchOn = false, shooting = false;
-let stableN = 0, lastQuad = null, autoHold = null, holdMiss = 0, wakeLock = null;
+   holds still, import from the photo library. Captures are processed in the background and the
+   cropped result is shown briefly, so every shot gets visible feedback. */
+let stream = null, track = null, imageCapture = null, camFromDoc = false, camCount = 0, liveTimer = null, torchOn = false, shooting = false, camGen = 0;
+let lastQuad = null, liveQuad = null, autoHold = null, holdSig = null, holdMissSince = 0, sigMissSince = 0, holdUntil = 0, anchorQuad = null, stableSince = 0, readyFrac = 0, wakeLock = null, peekTimer = null, peekUrl = '';
+let liveOn = false, rafId = 0, lastFrame = 0, shownQuad = null, targetQuad = null, quadAlpha = 0, readyShown = 0, lastSeenAt = 0, detWorker = null, detSeq = 0; const detPending = new Map();
 
 function updateCamUI() {
   $('modeSingle').classList.toggle('on', !settings.batch); $('modeBatch').classList.toggle('on', settings.batch);
@@ -17,27 +19,40 @@ async function keepAwake() {
   try { wakeLock = await navigator.wakeLock.request('screen'); wakeLock.addEventListener('release', () => { wakeLock = null; }); } catch (e) { wakeLock = null; }
 }
 async function openCamera(doc) {
-  camDoc = doc || null; camFromDoc = !!doc; camCount = 0; shooting = false; stableN = 0; lastQuad = null; autoHold = null;
-  $('doneThumb').hidden = true; $('camMsg').hidden = true; $('shutter').disabled = false; setHint('');
+  if (doc && !hasContent(doc)) { toast(STILL_DOWNLOADING); return; }
+  camDoc = doc || null; camFromDoc = !!doc; camCount = 0; shooting = false;
+  lastQuad = null; liveQuad = null; autoHold = null; holdSig = null; holdUntil = 0; anchorQuad = null; readyFrac = 0;
+  $('doneThumb').hidden = true; $('camMsg').hidden = true; $('shutter').disabled = false; setHint(''); hidePeek();
   push('cam'); updateCamUI();
   await startStream();
 }
 // also called when the app comes back to the front and the phone had taken the camera away
 async function startStream() {
+  const my = ++camGen;                               // a later start or a stop makes this call stand down
   if (stream) for (const t of stream.getTracks()) t.stop();
   stream = null; track = null; imageCapture = null;
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) { camError('This browser has no camera access. You can import photos instead.'); return; }
   let s;
   try { s = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1440 } }, audio: false }); }
-  catch (e) { camError(e && e.name === 'NotAllowedError' ? 'The camera permission was denied. Allow it in the site settings, or import photos instead.' : 'The camera could not be started. You can import photos instead.'); return; }
-  if (current() !== 'cam') { for (const t of s.getTracks()) t.stop(); return; }
+  catch (e) {
+    if (my !== camGen) return;
+    camError(e && e.name === 'NotAllowedError' ? 'The camera permission was denied. Allow it in the site settings, or import photos instead.' : 'The camera could not be started. You can import photos instead.'); return;
+  }
+  const drop = () => { for (const t of s.getTracks()) t.stop(); };
+  if (my !== camGen || current() !== 'cam') { drop(); return; }
   stream = s; track = stream.getVideoTracks()[0];
+  $('camMsg').hidden = true; $('shutter').disabled = false;
   imageCapture = self.ImageCapture ? new ImageCapture(track) : null;
   const v = $('video'); v.srcObject = stream;
   try { await v.play(); } catch (e) {}
+  if (my !== camGen) { drop(); if (stream === s) { stream = null; track = null; imageCapture = null; } return; }
   let caps = {}; try { caps = track.getCapabilities ? track.getCapabilities() : {}; } catch (e) {}
   $('torchBtn').hidden = !caps.torch; $('torchBtn').style.opacity = .6; torchOn = false;
   keepAwake(); startLive();
+}
+function resumeCam() {                               // back in front, or unlocked again
+  if (current() !== 'cam' || document.hidden || locked) return;
+  if (!track || track.readyState !== 'live') startStream(); else { keepAwake(); if (!liveOn) startLive(); }
 }
 function camError(msg) {
   const m = $('camMsg'); m.hidden = false; m.innerHTML = '<div>' + esc(msg) + '</div><button id="camImport">Import photos</button>';
@@ -45,67 +60,167 @@ function camError(msg) {
   $('shutter').disabled = true;
 }
 function stopCamera() {
-  stopLive();
+  camGen++; stopLive(); hidePeek();
   if (stream) for (const t of stream.getTracks()) t.stop();
   stream = null; track = null; imageCapture = null; $('video').srcObject = null;
   const ov = $('camOverlay'); ov.getContext('2d').clearRect(0, 0, ov.width, ov.height);
   if (wakeLock) { try { wakeLock.release(); } catch (e) {} wakeLock = null; }
-  camDoc = null; camFromDoc = false;
+  const d = camDoc; camDoc = null; camFromDoc = false;
+  if (d && !d.pages.length && !d.rev && docs.includes(d)) { dropEmptyDoc(d); persist(); }      // every shot failed: no empty document stays in the list
 }
-function startLive() { stopLive(); liveTimer = setInterval(liveDetect, 300); }
-function stopLive() { clearInterval(liveTimer); liveTimer = null; }
+// ---------- live outline ----------
+// Two loops. Detection runs about eight times a second, in its own worker where the browser allows
+// it, so the picture never stutters. Drawing runs with every screen refresh and glides the outline
+// toward the latest result, so it moves smoothly instead of jumping from find to find.
+function startDetWorker() {
+  if (detWorker || !self.Worker || !self.OffscreenCanvas || !self.createImageBitmap) return;
+  try {
+    detWorker = new Worker('worker.js');
+    detWorker.onmessage = e => { const p = detPending.get(e.data.id); if (!p) return; detPending.delete(e.data.id); if (e.data.ok) p.res(e.data); else p.rej(new Error(e.data.error)); };
+    detWorker.onerror = () => { for (const p of detPending.values()) p.rej(new Error('worker failed')); detPending.clear(); detWorker = null; };
+  } catch (e) { detWorker = null; }
+}
+function startLive() {
+  stopLive(); liveOn = true; startDetWorker();
+  shownQuad = null; targetQuad = null; quadAlpha = 0; readyShown = 0; lastSeenAt = 0; lastFrame = 0;
+  detectTick(); rafId = requestAnimationFrame(renderLive);
+}
+function stopLive() { liveOn = false; clearTimeout(liveTimer); liveTimer = null; cancelAnimationFrame(rafId); rafId = 0; }
 const quadDist = (a, b) => Math.max(...a.map((p, i) => Math.hypot(p[0] - b[i][0], p[1] - b[i][1])));
 const quadArea = qd => Math.abs(qd.reduce((a, p, i) => a + p[0] * qd[(i + 1) % 4][1] - qd[(i + 1) % 4][0] * p[1], 0)) / 2;
-function liveDetect() {
-  const v = $('video'); if (!v.videoWidth || current() !== 'cam' || document.hidden || shooting || locked) return;
-  let det = null; try { det = IMG.detectQuad(v, { size: 240 }); } catch (e) {}
+// What is on the page, as a tiny brightness pattern of the flattened outline. It stays the same when
+// the camera moves and changes when another page is put down.
+function pageSig(v, quad) {
+  try {
+    const small = IMG.drawCapped(v, 240), k = small.width / (v.videoWidth || small.width);
+    const w = IMG.warp(small, quad.map(p => [p[0] * k, p[1] * k]), { maxSide: 48 });
+    const c = IMG.makeCanvas(16, 16), cx = c.getContext('2d', { willReadFrequently: true }); cx.drawImage(w, 0, 0, 16, 16);
+    const d = cx.getImageData(0, 0, 16, 16).data, s = new Float32Array(256); let m = 0;
+    for (let i = 0; i < 256; i++) { s[i] = 0.3 * d[i * 4] + 0.59 * d[i * 4 + 1] + 0.11 * d[i * 4 + 2]; m += s[i]; }
+    m /= 256; for (let i = 0; i < 256; i++) s[i] -= m;
+    return s;
+  } catch (e) { return null; }
+}
+const sigDiff = (a, b) => { let t = 0; for (let i = 0; i < 256; i++) t += Math.abs(a[i] - b[i]); return t / 256; };
+// one detection on the current video frame; the result is in video pixels
+async function detectOnce(v) {
+  const vw = v.videoWidth, vh = v.videoHeight, k = Math.min(1, 240 / Math.max(vw, vh));
+  if (detWorker) {
+    try {
+      const bmp = await createImageBitmap(v, { resizeWidth: Math.max(1, Math.round(vw * k)), resizeHeight: Math.max(1, Math.round(vh * k)), resizeQuality: 'low' });
+      const kx = bmp.width / vw, ky = bmp.height / vh, id = ++detSeq;
+      const res = await new Promise((ok, no) => { detPending.set(id, { res: ok, rej: no }); detWorker.postMessage({ id, cmd: 'detect', bitmap: bmp, size: 240, prior: liveQuad ? liveQuad.map(p => [p[0] * kx, p[1] * ky]) : null }, [bmp]); });
+      return res.det ? { quad: res.det.quad.map(p => [p[0] / kx, p[1] / ky]), borders: res.det.borders } : null;
+    } catch (e) { if (detWorker) { try { detWorker.terminate(); } catch (e2) {} } detWorker = null; }      // from now on in the page itself
+  }
+  try { return IMG.detectQuad(v, { size: 240, prior: liveQuad || undefined }); } catch (e) { return null; }
+}
+async function detectTick() {
+  if (!liveOn) return;
+  const t0 = performance.now(), v = $('video');
+  if (v.videoWidth && current() === 'cam' && !document.hidden && !shooting && !locked && !passive) {
+    const gen = camGen, det = await detectOnce(v);
+    if (!liveOn || gen !== camGen) return;
+    if (!shooting) onDetection(det, v, performance.now());
+  }
+  if (liveOn) liveTimer = setTimeout(detectTick, Math.max(30, 120 - (performance.now() - t0)));
+}
+function onDetection(det, v, now) {
   const vw = v.videoWidth, vh = v.videoHeight, diag = Math.hypot(vw, vh);
   const quad = det && det.borders < 2 ? det.quad : null;
+  liveQuad = quad; if (quad) { targetQuad = quad; lastSeenAt = now; }
   const full = det && det.borders === 0 && quadArea(det.quad) > 0.2 * vw * vh ? det.quad : null;   // automatic capture wants all four edges
-  let hint = '', ready = 0;
+  let hint = '';
+  readyFrac = 0;
   if (settings.auto) {
-    if (autoHold) {                               // just captured: wait until this page has left before arming again
-      if (!full || quadDist(full, autoHold) > 0.06 * diag) { if (++holdMiss >= 3) autoHold = null; } else holdMiss = 0;
-      stableN = 0; hint = settings.batch ? 'Captured · next page' : '';
-    } else if (!full) { stableN = 0; hint = 'Looking for a document'; }
+    if (!autoHold && holdUntil > now && full) { autoHold = full; holdSig = pageSig(v, full); holdMissSince = 0; sigMissSince = 0; holdUntil = 0; }   // shutter pressed by hand without an outline: latch the page once it is seen
+    if (autoHold) {                                   // just captured: arm again only when this page has really gone
+      if (!full) { if (!holdMissSince) holdMissSince = now; else if (now - holdMissSince > 800) autoHold = null; }
+      else {
+        holdMissSince = 0;
+        const sg = holdSig ? pageSig(v, full) : null;
+        if (sg && sigDiff(sg, holdSig) > 12) { if (!sigMissSince) sigMissSince = now; else if (now - sigMissSince > 450) autoHold = null; } else sigMissSince = 0;      // another page lies there now
+      }
+      anchorQuad = null; hint = settings.batch ? 'Captured · next page' : '';
+    } else if (!full) { anchorQuad = null; hint = 'Looking for a document'; }
     else {
-      stableN = lastQuad && quadDist(full, lastQuad) < 0.02 * diag ? stableN + 1 : 0;
-      hint = 'Hold still'; ready = Math.min(1, stableN / 4);
-      if (stableN >= 4) { stableN = 0; shoot(); }
+      if (!anchorQuad || quadDist(full, anchorQuad) > 0.03 * diag) { anchorQuad = full; stableSince = now; }      // moved: the clock starts again
+      readyFrac = Math.min(1, (now - stableSince) / 900);
+      hint = 'Hold still';
+      if (readyFrac >= 1) { anchorQuad = null; lastQuad = full; setHint(hint); shoot(); return; }
     }
     lastQuad = full;
   }
-  drawOverlay(quad, vw, vh, ready); setHint(hint);
+  setHint(hint);
 }
-function drawOverlay(quad, vw, vh, ready) {
-  const ov = $('camOverlay'), box = ov.getBoundingClientRect();
-  const W = Math.round(box.width), H = Math.round(box.height); if (!W || !H) return;
+function renderLive(ts) {
+  if (!liveOn) return;
+  rafId = requestAnimationFrame(renderLive);
+  const v = $('video'); if (!v.videoWidth || document.hidden) return;
+  const dt = Math.min(100, lastFrame ? ts - lastFrame : 16); lastFrame = ts;
+  const ease = 1 - Math.exp(-dt / 70), now = performance.now();
+  if (targetQuad && now - lastSeenAt < 450) {         // a short gap in detection does not make the outline flicker
+    if (!shownQuad) shownQuad = targetQuad.map(p => p.slice());
+    else for (let i = 0; i < 4; i++) { shownQuad[i][0] += (targetQuad[i][0] - shownQuad[i][0]) * ease; shownQuad[i][1] += (targetQuad[i][1] - shownQuad[i][1]) * ease; }
+    quadAlpha = Math.min(1, quadAlpha + dt / 140);
+  } else { quadAlpha = Math.max(0, quadAlpha - dt / 220); if (!quadAlpha) shownQuad = null; }
+  readyShown += (readyFrac - readyShown) * (1 - Math.exp(-dt / 90));
+  drawOverlay(shownQuad, v.videoWidth, v.videoHeight, readyShown, quadAlpha);
+}
+function drawOverlay(quad, vw, vh, ready, alpha) {
+  const ov = $('camOverlay'), box = ov.getBoundingClientRect(), dpr = Math.min(2, self.devicePixelRatio || 1);
+  const W = Math.round(box.width * dpr), H = Math.round(box.height * dpr); if (!W || !H) return;
   if (ov.width !== W || ov.height !== H) { ov.width = W; ov.height = H; }
   const cx = ov.getContext('2d'); cx.clearRect(0, 0, W, H);
-  if (!quad) return;
-  const s = Math.min(W / vw, H / vh), ox = (W - vw * s) / 2, oy = (H - vh * s) / 2;
-  cx.beginPath(); quad.forEach((p, i) => cx[i ? 'lineTo' : 'moveTo'](ox + p[0] * s, oy + p[1] * s)); cx.closePath();
-  cx.fillStyle = 'rgba(45,212,191,' + (0.16 + 0.3 * (ready || 0)).toFixed(2) + ')'; cx.fill(); cx.lineWidth = 3; cx.strokeStyle = '#2dd4bf'; cx.stroke();
+  if (!quad || !(alpha > 0)) return;
+  const s = Math.min(W / vw, H / vh), ox = (W - vw * s) / 2, oy = (H - vh * s) / 2, P = quad.map(p => [ox + p[0] * s, oy + p[1] * s]);
+  cx.globalAlpha = alpha; cx.lineJoin = 'round';
+  cx.beginPath(); P.forEach((p, i) => cx[i ? 'lineTo' : 'moveTo'](p[0], p[1])); cx.closePath();
+  cx.fillStyle = 'rgba(45,212,191,' + (0.14 + 0.3 * ready).toFixed(3) + ')'; cx.fill();
+  cx.lineWidth = (2.5 + 1.5 * ready) * dpr; cx.strokeStyle = '#2dd4bf'; cx.stroke();
+  for (const p of P) { cx.beginPath(); cx.arc(p[0], p[1], (5 + 3 * ready) * dpr, 0, Math.PI * 2); cx.fillStyle = '#fff'; cx.fill(); cx.lineWidth = 2 * dpr; cx.strokeStyle = '#0f766e'; cx.stroke(); }
+  cx.globalAlpha = 1;
 }
 async function takePhotoBlob() {
   if (imageCapture) { try { return await imageCapture.takePhoto(); } catch (e) {} }     // full sensor resolution where the browser offers it
   const v = $('video'), c = IMG.makeCanvas(v.videoWidth, v.videoHeight); c.getContext('2d').drawImage(v, 0, 0);
   return IMG.toBlob(c, 'image/jpeg', 0.92);
 }
+// small picture for the Done button, taken from the live view and already cut to the outline
+function quickThumb(v, quad) {
+  try {
+    const small = IMG.drawCapped(v, 360);
+    if (!quad) return IMG.drawCapped(small, 120).toDataURL('image/jpeg', 0.7);
+    const k = small.width / v.videoWidth;
+    return IMG.warp(small, quad.map(p => [p[0] * k, p[1] * k]), { maxSide: 140 }).toDataURL('image/jpeg', 0.7);
+  } catch (e) { return null; }
+}
 async function shoot() {
-  if (shooting || !stream) return; shooting = true;
-  autoHold = lastQuad; holdMiss = 0; stableN = 0;
+  if (shooting || !stream || locked) return; shooting = true;
+  const d0 = camDoc, v = $('video'), quad0 = lastQuad;
+  autoHold = quad0; holdSig = quad0 ? pageSig(v, quad0) : null; holdUntil = quad0 ? 0 : performance.now() + 3000; holdMissSince = 0; sigMissSince = 0; anchorQuad = null; readyFrac = 0;
   const fx = $('flashFx'); fx.classList.remove('on'); void fx.offsetWidth; fx.classList.add('on');
-  let thumb = null; try { thumb = IMG.drawCapped($('video'), 120).toDataURL('image/jpeg', 0.7); } catch (e) {}
+  const thumb = quickThumb(v, quad0 || liveQuad);
   let blob = null; try { blob = await takePhotoBlob(); } catch (e) {}
   shooting = false;
-  if (current() !== 'cam') return;
   if (!blob) { toast('Could not take the photo.'); return; }
+  if (current() !== 'cam' || camDoc !== d0) { lateCapture(blob, d0); return; }      // Done, X or Back was pressed while the photo was being taken
   addCapture(blob, thumb, false);
+}
+// A shot that already flashed is never thrown away: it goes into the document the camera was
+// working on, or into a new one.
+function lateCapture(blob, d0) {
+  let d = d0 && docs.includes(d0) && !d0.deleted ? d0 : null;
+  if (!d) d = newDoc();
+  const pageId = uid();
+  d.pages.push({ id: pageId, status: 'processing' }); save({ sync: false });
+  queue(() => processNew(d, pageId, blob)); renderAll();
+  toast('The last shot was added to ' + ((d.name || '').trim() || 'a new document') + '.');
 }
 // A capture becomes a placeholder page at once; the worker fills it in.
 function addCapture(blob, thumb, stay) {
   if (!camDoc) camDoc = newDoc();
+  else if (!docs.includes(camDoc)) { docs.unshift(camDoc); snap[camDoc.id] = sigOf(camDoc); }      // dropped after a failed first page: take it back
   const d = camDoc, pageId = uid();
   d.pages.push({ id: pageId, status: 'processing' }); camCount++;
   save({ sync: false });
@@ -116,7 +231,7 @@ function addCapture(blob, thumb, stay) {
 }
 function finishCamera() {
   const d = camDoc;
-  if (camFromDoc || !d) { back(); return; }
+  if (camFromDoc || !d || !docs.includes(d)) { back(); return; }
   stopCamera(); openDoc(d, { replace: true, fresh: true });      // straight to the pages, cursor in the name
 }
 function dropEmptyDoc(d) {
@@ -124,18 +239,41 @@ function dropEmptyDoc(d) {
   if (curDoc === d && current() === 'doc') back();
 }
 async function processNew(d, pageId, blob) {
+  const fail = () => {                                // nothing half-done stays behind, whatever step failed
+    const i = d.pages.findIndex(x => x.id === pageId); if (i >= 0) d.pages.splice(i, 1);
+    idb.del('pages', pageId).catch(() => {});
+    if (d === camDoc) { camCount = Math.max(0, camCount - 1); updateCamUI(); }
+    if (!d.pages.length && !d.rev && d !== camDoc) dropEmptyDoc(d);
+    save({ sync: false }); renderAll();
+  };
   let r;
   try { r = await task({ cmd: 'process', blob, filter: settings.filter, keepOrig: true, maxOrig: 2800, maxOut: 2400 }); }
-  catch (e) {
-    const i = d.pages.findIndex(x => x.id === pageId); if (i >= 0) d.pages.splice(i, 1);
-    if (!d.pages.length && !d.rev) dropEmptyDoc(d);
-    save({ sync: false }); renderAll(); throw e;
-  }
+  catch (e) { fail(); throw e; }
   const p = d.pages.find(x => x.id === pageId);
   if (!p || d.deleted) return;                                  // removed while it was processing
-  await pagePut(pageId, d.id, { jpeg: r.jpeg, prev: r.prev, orig: r.orig, meta: { quad: r.quad, w: r.w, h: r.h, origW: r.origW, origH: r.origH, filter: settings.filter, rot: 0, thumb: r.thumb } });
+  try { await pagePut(pageId, d.id, { jpeg: r.jpeg, prev: r.prev, orig: r.orig, meta: { quad: r.quad, w: r.w, h: r.h, origW: r.origW, origH: r.origH, filter: settings.filter, rot: 0, thumb: r.thumb } }); }
+  catch (e) { fail(); throw e; }
   Object.assign(p, { w: r.w, h: r.h, size: r.jpeg.size, o: 1 }); delete p.status;
-  touchContent(d); save(); renderAll();
+  if (!docs.includes(d) && !d.deleted) { docs.unshift(d); snap[d.id] = sigOf(d); }
+  if (hasContent(d)) { touchContent(d); save(); }
+  else { p.local = 1; save({ sync: false }); syncNow(); }        // a newer version is still downloading: this page is added to it once it is here
+  renderAll(); showPeek(d, r);
+}
+// feedback after each shot: the cropped, cleaned page pops up for a moment and lands on the Done button
+function showPeek(d, r) {
+  if (current() !== 'cam' || camDoc !== d || locked) return;
+  $('doneThumb').src = r.thumb; $('doneThumb').hidden = false;
+  hidePeek();
+  const el = $('camPeek'), img = $('camPeekImg');
+  peekUrl = URL.createObjectURL(r.prev); img.src = peekUrl;
+  $('camPeekLbl').textContent = 'Page ' + d.pages.filter(x => !x.status).length;
+  el.hidden = false; el.classList.remove('go'); void el.offsetWidth; el.classList.add('go');
+  peekTimer = setTimeout(hidePeek, 1700);
+}
+function hidePeek() {
+  clearTimeout(peekTimer); peekTimer = null;
+  const el = $('camPeek'); el.hidden = true; el.classList.remove('go');
+  if (peekUrl) { URL.revokeObjectURL(peekUrl); peekUrl = ''; }
 }
 function pickPhotos() { holdReloadUntil = Date.now() + 600000; $('importInput').click(); }   // the picker hides the app; do not restart it on return
 $('shutter').addEventListener('click', shoot);
@@ -143,7 +281,7 @@ $('camClose').addEventListener('click', () => { if (camCount && !camFromDoc) fin
 $('done').addEventListener('click', finishCamera);
 $('modeSingle').addEventListener('click', () => { settings.batch = false; saveSettings(); updateCamUI(); });
 $('modeBatch').addEventListener('click', () => { settings.batch = true; saveSettings(); updateCamUI(); });
-$('autoBtn').addEventListener('click', () => { settings.auto = !settings.auto; saveSettings(); stableN = 0; autoHold = null; updateCamUI(); });
+$('autoBtn').addEventListener('click', () => { settings.auto = !settings.auto; saveSettings(); anchorQuad = null; autoHold = null; holdUntil = 0; readyFrac = 0; updateCamUI(); });
 $('torchBtn').addEventListener('click', async () => {
   if (!track) return; torchOn = !torchOn;
   try { await track.applyConstraints({ advanced: [{ torch: torchOn }] }); } catch (e) { torchOn = false; }
@@ -154,7 +292,7 @@ $('importInput').addEventListener('cancel', () => { holdReloadUntil = 0; });
 $('importInput').addEventListener('change', e => {
   const files = Array.from(e.target.files || []).filter(f => /^image\//.test(f.type) || /\.(jpe?g|png|webp)$/i.test(f.name));
   e.target.value = ''; holdReloadUntil = 0;
-  if (!files.length || current() !== 'cam') return;
+  if (!files.length || current() !== 'cam' || passive) return;
   for (const f of files) addCapture(f, null, true);
   finishCamera();
 });

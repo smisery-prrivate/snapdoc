@@ -24,6 +24,7 @@
     const c = makeCanvas(w * s, h * s);
     const cx = ctx2d(c);
     cx.imageSmoothingEnabled = true; cx.imageSmoothingQuality = 'high';
+    cx.fillStyle = '#fff'; cx.fillRect(0, 0, c.width, c.height);      // transparent areas of an imported image become paper white, not black
     cx.drawImage(src, 0, 0, c.width, c.height);
     return c;
   };
@@ -413,6 +414,13 @@
       r.quad = quad; r.origW = src.width; r.origH = src.height;
       r.orig = m.keepOrig ? await IMG.toBlob(src, 'image/jpeg', 0.85) : null;
       return r;
+    },
+    // live outline: one small video frame in, one outline out (runs in its own worker)
+    async detect(m) {
+      let det = null;
+      try { det = IMG.detectQuad(m.bitmap, { size: m.size || 240, prior: m.prior || undefined }); } catch (e) { det = null; }
+      if (m.bitmap && m.bitmap.close) m.bitmap.close();
+      return { det: det ? { quad: det.quad, borders: det.borders, score: det.score } : null };
     },
     async rotate(m) {
       const bmp = await createImageBitmap(m.blob);

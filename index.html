@@ -135,7 +135,8 @@
   .statecard .s { font-size: 13px; color: var(--muted); margin-top: 2px; line-height: 1.45; }
   .rowopt { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 8px; font-size: 15px; }
   .rowopt select { width: auto; margin: 0; min-width: 150px; }
-  .version { font-size: 12px; color: #c8c1b5; text-align: center; margin-top: 14px; }
+  .version { font-size: 13px; color: var(--muted); text-align: center; margin-top: 14px; }
+  .vtag { font-size: 12px; font-weight: 500; color: var(--muted); margin-left: 6px; letter-spacing: 0; }
 
   .popup { position: fixed; inset: 0; z-index: 45; background: rgba(30,28,25,.45); display: none; align-items: center; justify-content: center; padding: 20px; }
   .popup.open { display: flex; }
@@ -156,6 +157,20 @@
   #lock .quiet { background: transparent; border: none; color: var(--muted); font-size: 14px; padding: 10px; }
   #lockErr { color: var(--danger); font-size: 14px; min-height: 18px; }
 
+  .okbtn { height: 40px; padding: 0 18px; border: none; border-radius: 20px; background: var(--accent); color: #fff; font-size: 15px; font-weight: 700; flex: none; }
+  .okbtn:active { background: var(--accent-dark); }
+  .secondary:disabled { opacity: .45; }
+  .hint.warn { color: var(--danger); }
+  #camPeek { position: absolute; left: 50%; top: 50%; width: 62%; max-width: 300px; transform: translate(-50%, -50%); z-index: 2; pointer-events: none; text-align: center; }
+  #camPeek img { display: block; width: 100%; height: auto; max-height: 56vh; object-fit: contain; border-radius: 8px; background: #fff; box-shadow: 0 12px 40px rgba(0,0,0,.6); border: 2px solid #2dd4bf; }
+  #camPeek span { display: inline-block; margin-top: 8px; background: rgba(0,0,0,.65); color: #fff; font-size: 13px; font-weight: 600; padding: 4px 12px; border-radius: 12px; }
+  #camPeek.go { animation: peek 1.7s cubic-bezier(.2,.8,.2,1) forwards; }
+  @keyframes peek { 0% { opacity: 0; transform: translate(-50%, -50%) scale(.6); } 12% { opacity: 1; transform: translate(-50%, -50%) scale(1); } 70% { opacity: 1; transform: translate(-50%, -50%) scale(1); } 100% { opacity: 0; transform: translate(20%, 90%) scale(.18); } }
+  #away { position: fixed; inset: 0; z-index: 55; background: var(--bg); display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 14px; padding: 30px; text-align: center; }
+  #away .logo { width: 84px; height: 84px; border-radius: 24px; background: var(--accent); color: #fff; display: flex; align-items: center; justify-content: center; font-size: 40px; margin-bottom: 8px; }
+  #away h2 { font-size: 21px; max-width: 320px; }
+  #away p { color: var(--muted); font-size: 15px; max-width: 300px; line-height: 1.5; }
+  #away .btn { width: 100%; max-width: 320px; height: 56px; border: none; border-radius: 16px; background: var(--accent); color: #fff; font-size: 17px; font-weight: 700; }
   #toast { position: fixed; left: 50%; bottom: calc(env(safe-area-inset-bottom) + 130px); transform: translateX(-50%); z-index: 50; background: rgba(30,28,25,.92); color: #fff; padding: 12px 16px; border-radius: 14px; font-size: 15px; display: none; align-items: center; gap: 14px; max-width: 92vw; }
   #toast.show { display: flex; }
   #toast button { height: 36px; padding: 0 12px; border: none; border-radius: 10px; background: #fff; color: #000; font-weight: 700; font-size: 14px; }
@@ -170,7 +185,7 @@
 <section id="home" class="screen">
   <div class="col">
     <header class="top">
-      <div style="flex:1;min-width:0"><h1>Snapdoc</h1></div>
+      <div style="flex:1;min-width:0"><h1>Snapdoc <span id="vtag" class="vtag"></span></h1></div>
       <button id="menuBtn" class="pill">Menu</button>
     </header>
     <div id="syncline" class="subline"></div>
@@ -188,6 +203,7 @@
     <header class="top">
       <button id="docBack" class="icon" aria-label="Back">←</button>
       <input id="docName" type="text" autocomplete="off" autocapitalize="sentences" enterkeyhint="done" aria-label="Document name">
+      <button id="docOk" class="okbtn" aria-label="Save the name" hidden>OK</button>
       <button id="docMore" class="icon" aria-label="More">⋯</button>
     </header>
     <div id="docMeta" class="subline"></div>
@@ -229,6 +245,7 @@
     <canvas id="camOverlay"></canvas>
     <div id="camHint" hidden></div>
     <div id="camMsg" hidden></div>
+    <div id="camPeek" hidden><img id="camPeekImg" alt=""><span id="camPeekLbl"></span></div>
     <div id="flashFx"></div>
   </div>
   <div class="cambot">
@@ -248,6 +265,12 @@
   <button id="unlockBtn" class="btn">Unlock</button>
   <div id="lockErr"></div>
   <button id="lockReset" class="quiet">Can't unlock? Reset this app</button>
+</div>
+<div id="away" hidden>
+  <div class="logo">⧉</div>
+  <h2>Snapdoc is open in another tab or window</h2>
+  <p>Only one can be active at a time, so that nothing gets overwritten.</p>
+  <button id="awayBtn" class="btn">Use Snapdoc here</button>
 </div>
 <div id="toast"></div>
 <input type="file" id="importInput" accept="image/*" multiple hidden>

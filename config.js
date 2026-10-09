@@ -8,5 +8,5 @@
 window.APP_CONFIG = window.APP_CONFIG || {
   supabaseUrl: 'https://gbhhsbmxdkpoejuvkgos.supabase.co',
   supabaseKey: 'sb_publishable_V9NGy2U_4mzR3IXrMQMLzA_M6QnpPmB',
-  googleClientId: ''
+  googleClientId: '873358018805-g1s51crb4r6en0cm1qftt7nua9i8kn52.apps.googleusercontent.com'
 };

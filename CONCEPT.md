@@ -21,8 +21,9 @@ first). Working name, visible in `index.html`, `manifest.json` and `VERSION` in 
   straightened. No brightening, no filter. (Looks exist in the code and are switched off, see
   "The look of a page".)
 - **Find and pick.** A search field above the list filters by name and date as you type.
-  *Select* turns the list into a pick list: a tap picks a document instead of opening it, and the
-  bar at the bottom shares or saves all picked PDFs at once.
+  *Select*, or a long press on a document, turns the list into a pick list: a tap picks a
+  document instead of opening it, and the bar at the bottom shares, saves or deletes all picked
+  documents at once.
 - **Name.** A new document is called `YYYY-MM-DD ` with the cursor behind the space, keyboard open.
   An OK button next to the field saves the name and says so.
 - **Document view.** All pages one below the other. Every page carries an **Adjust crop**
@@ -255,6 +256,7 @@ makes every device send what it holds once more in the new form.
 - v6: new page detector (see "Finding the page"). Not independently reviewed yet.
 - v7: search field and pick mode on the home list (share or save several PDFs at once).
 - v8: Google Drive copies (plain PDFs in the user's own Drive, uploaded from the device).
+- v9: long press picks a document, Delete for several documents at once.
 
 ## Tested, and not yet
 

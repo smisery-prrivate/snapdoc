@@ -10,10 +10,10 @@ function cloudGlyph(d) {
   if (d.pushed_rev < d.rev || rowBehind(d)) return '<span class="cloud busy" title="Waiting to upload">☁↑</span>';
   return '<span class="cloud ok" title="In the cloud, encrypted">☁✓</span>';
 }
-// Search filters the list by name and date. Select turns the list into a pick list: a tap on a
-// document selects it instead of opening it, and the bar at the bottom shares or saves the
-// chosen PDFs at once.
-let homeQuery = '', selectMode = false; const selected = new Set();
+// Search filters the list by name and date. Select (or a long press on a document) turns the
+// list into a pick list: a tap on a document selects it instead of opening it, and the bar at
+// the bottom shares, saves or deletes the chosen documents at once.
+let homeQuery = '', selectMode = false, pressed = false; const selected = new Set();
 const homeLabel = d => d.name.trim() || dateStamp(d.created_at);
 const matches = d => !homeQuery || (homeLabel(d) + ' ' + fmtDate(d.created_at) + ' ' + dateStamp(d.created_at)).toLowerCase().includes(homeQuery);
 function renderHome() {
@@ -24,7 +24,7 @@ function renderHome() {
   $('scanDock').hidden = selectMode; $('selDock').hidden = !selectMode;
   const n = selected.size;
   $('selShare').textContent = n ? 'Share ' + n + (n === 1 ? ' PDF' : ' PDFs') : 'Share'; $('selSave').textContent = 'Save';
-  $('selShare').disabled = !n; $('selSave').disabled = !n;
+  $('selShare').disabled = !n; $('selSave').disabled = !n; $('selDelete').disabled = !n;
   const items = all.filter(matches);
   list.innerHTML = '';
   if (!items.length) {
@@ -38,11 +38,19 @@ function renderHome() {
     el.innerHTML = '<div class="th"></div><div class="body"><div class="name">' + esc(homeLabel(d)) + '</div><div class="meta">' + esc(fmtDate(d.created_at)) + ' · ' + n + (n === 1 ? ' page' : ' pages') + (d.size ? ' · ' + fmtSize(d.size) : '') + '</div></div>' + (selectMode ? '<div class="tick"></div>' : cloudGlyph(d));
     thumbGet(d.id).then(t => { if (!t || !el.isConnected) return; const img = new Image(); img.className = 'th'; img.alt = ''; img.src = t; el.replaceChild(img, el.firstChild); });
     el.addEventListener('click', () => {
+      if (pressed) { pressed = false; return; }        // the click that follows a long press
       if (!selectMode) { openDoc(d); return; }
       if (!hasContent(d)) { toast(STILL_DOWNLOADING); return; }
       if (selected.has(d.id)) selected.delete(d.id); else selected.add(d.id);
       renderHome();
     });
+    // a long press starts the pick list with this document picked
+    let t = null, x0 = 0, y0 = 0;
+    const cancel = () => { clearTimeout(t); t = null; };
+    el.addEventListener('pointerdown', e => { x0 = e.clientX; y0 = e.clientY; cancel(); t = setTimeout(() => { t = null; if (!hasContent(d)) return; pressed = true; selectMode = true; selected.add(d.id); if (navigator.vibrate) navigator.vibrate(20); renderHome(); }, 450); });
+    el.addEventListener('pointermove', e => { if (t && Math.hypot(e.clientX - x0, e.clientY - y0) > 10) cancel(); });
+    el.addEventListener('pointerup', cancel); el.addEventListener('pointercancel', cancel); el.addEventListener('pointerleave', cancel);
+    el.addEventListener('contextmenu', e => e.preventDefault());
     list.appendChild(el);
   }
   list.scrollTop = st;
@@ -82,6 +90,12 @@ async function selAction(share) {
   finally { selBusy = false; busy(false); renderHome(); }
 }
 $('selShare').addEventListener('click', () => selAction(true));
+$('selDelete').addEventListener('click', () => {
+  const list = [...selected].map(byId).filter(d => d && !d.deleted); if (!list.length) return;
+  popup(list.length === 1 ? 'Delete this document?' : 'Delete ' + list.length + ' documents?', 'All their pages and PDFs are removed' + (SYNC && session ? ' here and in the cloud' : '') + '.', [
+    { label: 'Delete', cls: 'danger', fn: async () => { for (const d of list) d.deleted = true; save(); for (const d of list) await purgeDocData(d); persist(); setSelectMode(false); renderAll(); toast(list.length === 1 ? 'Document deleted' : list.length + ' documents deleted'); } },
+    { label: 'Keep', cls: 'quiet' }]);
+});
 $('selSave').addEventListener('click', () => selAction(false));
 $('scanBtn').addEventListener('click', () => openCamera(null));
 $('menuBtn').addEventListener('click', () => openSheet());

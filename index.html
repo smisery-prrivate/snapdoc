@@ -51,7 +51,9 @@
   .card .tick { width: 26px; height: 26px; border-radius: 13px; border: 2px solid var(--line); flex: none; display: flex; align-items: center; justify-content: center; color: #fff; font-size: 15px; font-weight: 700; }
   .card.sel .tick { background: var(--accent); border-color: var(--accent); }
   .card.sel .tick::after { content: '✓'; }
-  #selDock .secondary { padding: 0 14px; }
+  #selDock .secondary { padding: 0 12px; }
+  #selDock .del { color: var(--danger); background: var(--danger-bg); border-color: transparent; }
+  .card { touch-action: pan-y; -webkit-touch-callout: none; }
 
   /* thumb zone */
   .dock { position: fixed; left: 50%; transform: translateX(-50%); bottom: 0; width: 100%; max-width: 480px; padding: 14px 16px calc(env(safe-area-inset-bottom) + 18px); z-index: 4; display: flex; align-items: center; justify-content: center; gap: 10px; background: linear-gradient(to top, var(--bg) 70%, rgba(245,243,238,0)); }
@@ -222,6 +224,7 @@
   <div class="dock" id="selDock" hidden>
     <button id="selShare" class="primary">Share</button>
     <button id="selSave" class="secondary">Save</button>
+    <button id="selDelete" class="secondary del">Delete</button>
     <button id="selCancel" class="secondary">Cancel</button>
   </div>
 </section>

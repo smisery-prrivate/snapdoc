@@ -1,5 +1,5 @@
 // Bump CACHE on every release; keep it equal to the version label in the menu.
-const CACHE = 'snapdoc-v1';
+const CACHE = 'snapdoc-v2';
 const ASSETS = ['.', 'index.html', 'vault.js', 'app-core.js', 'app-docs.js', 'app-cam.js', 'app-lock.js', 'app-sync.js', 'app-boot.js', 'imaging.js', 'worker.js', 'config.js', 'manifest.json', 'icon-192.png', 'icon-512.png'];
 
 self.addEventListener('install', e => {

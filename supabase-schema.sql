@@ -39,6 +39,15 @@ create table if not exists public.sd_keys (
 alter table public.sd_documents enable row level security;
 alter table public.sd_keys enable row level security;
 
+-- explicit privileges, so the script works whether or not the project exposes new tables by itself:
+-- visitors who are not signed in get nothing; signed-in users get table access, which row level
+-- security then narrows to their own rows
+revoke all on public.sd_documents from anon;
+revoke all on public.sd_keys from anon;
+grant usage on schema public to authenticated;
+grant select, insert, update, delete on public.sd_documents to authenticated;
+grant select, insert, update on public.sd_keys to authenticated;
+
 drop policy if exists "sd select" on public.sd_documents;
 drop policy if exists "sd insert" on public.sd_documents;
 drop policy if exists "sd update" on public.sd_documents;
@@ -72,3 +81,6 @@ create policy "sd obj update" on storage.objects for update to authenticated
   using (bucket_id = 'sd' and (storage.foldername(name))[1] = auth.uid()::text);
 create policy "sd obj delete" on storage.objects for delete to authenticated
   using (bucket_id = 'sd' and (storage.foldername(name))[1] = auth.uid()::text);
+
+-- tell the Data API about the new tables right away
+notify pgrst, 'reload schema';

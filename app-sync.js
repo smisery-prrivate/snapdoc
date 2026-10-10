@@ -23,6 +23,7 @@ async function loadSession() {
   session = null;
   try { const r = await idb.get('meta', 'session'); if (r) session = await Vault.openJson(r.data, 'sd|session'); } catch (e) { session = null; }
   if (session) await Vault.loadCloudKey(session.uid).catch(() => {});
+  if (session && docsLoaded && !account) { account = session.uid; persist(); }      // an install signed in before v13: the account moves into the list
 }
 async function storeSession() {
   if (session) await idb.put('meta', { id: 'session', data: await Vault.sealJson(session, 'sd|session') }); else await idb.del('meta', 'session');
@@ -33,11 +34,11 @@ async function storeSession() {
 // own; a document with nothing here is dropped.
 function resolveLocal() {
   const now = Date.now();
-  for (const d of docs) {
+  for (const d of docs.slice()) {
     if (d.deleted || d.rev_have === d.rev) continue;
     if (d.pages.some(p => !p.status)) { d.rev = Math.max(now, d.rev + 1); d.rtag = newTag(); d.rev_have = d.rev; for (const p of d.pages) delete p.local; d.pageCount = d.pages.filter(p => !p.status).length; }
     else if (d.pages.length) d.rev_have = d.rev;                   // pages still being worked on: they finish into this document
-    else { d.deleted = true; d.updated_at = Math.max(now, d.updated_at + 1); }
+    else { docs.splice(docs.indexOf(d), 1); delete snap[d.id]; }   // nothing here and nothing to tell any cloud: gone, not a marker
   }
 }
 // Tokens from a sign-in link. Accepted only when this browser asked for a link within the last
@@ -82,10 +83,12 @@ async function adoptLink(t) {
   await Vault.loadCloudKey(session.uid).catch(() => {});
   return '';
 }
+// Signing out keeps every cloud mark: the account may come back, and then the cloud's newer
+// versions must still win over what waited here. A document that was waiting for a download stays
+// "downloading" until a sign-in brings it (or an account change resolves it).
 async function signOut() {
   session = null; keyNeed = ''; keyEnv = null;
   await storeSession(); await Vault.dropCloudKey();
-  resolveLocal(); persist();                                       // nothing can arrive from the cloud any more: what is here is what there is
   setSyncState(''); renderAll();
 }
 async function ensureSession() {
@@ -242,7 +245,7 @@ async function applyRow(row) {
         adoptCloud(d, rev, tag, m);
         if (!holdsIt) d.rev_have = -1;                            // the pages here are not that version: download
       } else if (rev < d.pushed_rev && !wasDeleted) {             // the cloud went back to older pages (a device that never saw ours brought it back)
-        if (d.rev_have === d.rev && d.pages.some(p => !p.status)) { d.pushed_rev = rev; d.pushed_tag = tag; d.up_rev = 0; d.up_tag = ''; d.rtag = newTag(); }   // ours is newer: file (under a fresh name) and entry go up again
+        if (d.rev_have === d.rev && d.pages.some(p => !p.status)) { oweUp(d); d.pushed_rev = rev; d.pushed_tag = tag; d.up_rev = 0; d.up_tag = ''; d.rtag = newTag(); }   // ours is newer: file (under a fresh name) and entry go up again
         else { adoptCloud(d, rev, tag, m); d.rev_have = -1; }
       }
     }
@@ -254,12 +257,13 @@ async function applyRow(row) {
   } else if (upd === d.updated_at) {                              // the same stamp: normally this device's own entry echoed back
     if (!!m.del !== !!d.deleted) {                                 // two devices stamped alike: a delete beats a live change, on both of them
       if (del) { d.deleted = true; d.srv = upd; await deletedElsewhere(d); } else { d.srv = -1; d.cloudPurged = false; }
-    } else if (!del && String(m.name || '') !== d.name) {          // two different names with one stamp: the larger revision, then the larger name, on both of them
-      if (rev > d.rev || (rev === d.rev && String(m.name || '') > d.name)) { d.name = String(m.name || ''); d.srv = upd; } else d.srv = -1;
+    } else if (!del && String(m.name || '') !== d.name) {          // two different names with one stamp: the larger name, which both devices see alike
+      if (String(m.name || '') > d.name) { d.name = String(m.name || ''); d.srv = upd; } else d.srv = -1;
     } else d.srv = upd;
   } else if (del && !d.deleted) {                                   // our later change keeps the document, but the other device removed the file
     if (d.pages.some(p => !p.status)) {                           // the pages here are the only ones left: they are the newest version and go up again, under a fresh name
       for (const p of d.pages) delete p.local;
+      oweUp(d);
       d.rev = Math.max(Date.now(), d.rev + 1); d.rtag = newTag(); d.rev_have = d.rev; d.pageCount = d.pages.filter(p => !p.status).length;
       d.pushed_rev = 0; d.pushed_tag = ''; d.up_rev = 0; d.up_tag = ''; d.srv = -1;
     } else { d.deleted = true; d.updated_at = upd; d.srv = upd; await deletedElsewhere(d); }
@@ -296,13 +300,16 @@ const sealedMeta = d => Vault.csealJson(d.deleted ? { del: true, u: d.updated_at
   : { name: d.name, pages: hasContent(d) ? (d.pages.filter(p => !p.status && !p.local).length || d.pageCount || 0) : (d.pageCount || 0), size: d.size || 0, created_at: d.created_at, rev: d.up_rev || 0, tag: d.up_tag || '', u: d.updated_at, del: false }, 'sd|meta|' + d.id);
 // An object this device no longer needs in the bucket: removed now, or remembered on the document
 // and removed on a later pass. Nothing is left behind for good.
+const owedFail = new Map();      // object name -> { n, until }: a removal the cloud keeps refusing is tried again after a growing pause (an hour at most)
 async function dropObj(u, d, name) {
   let ok = false;
   try { const r = await api('DELETE', '/storage/v1/object/sd/' + name); ok = r.ok || r.status === 404 || (r.status === 400 && /not.?found/i.test(await r.text().catch(() => ''))); } catch (e) {}
-  if (ok) { if (d.owed) { d.owed = d.owed.filter(n => n !== name); if (!d.owed.length) delete d.owed; } }
-  else { d.owed = d.owed || []; if (!d.owed.includes(name)) d.owed.push(name); }
+  if (ok) { owedFail.delete(name); if (d.owed) { d.owed = d.owed.filter(n => n !== name); if (!d.owed.length) delete d.owed; } }
+  else { d.owed = d.owed || []; if (!d.owed.includes(name)) d.owed.push(name); const f = owedFail.get(name), n = (f ? f.n : 0) + 1; owedFail.set(name, { n, until: Date.now() + Math.min(3600000, 60000 * Math.pow(4, n - 1)) }); }
   return ok;
 }
+// the file this device sent for a version whose entry was never accepted is no longer needed once the version is replaced
+const oweUp = d => { if (d.up_tag && d.up_tag !== (d.pushed_tag || '') && session) { d.owed = d.owed || []; const n = objName(session.uid, d, d.up_tag); if (!d.owed.includes(n)) d.owed.push(n); } };
 // does the cloud entry of this document have to be written?
 const entryDue = d => d.deleted ? ((d.srv !== 0 || d.pushed_rev > 0) && d.srv !== d.updated_at)
   : d.up_rev > 0 && (d.up_rev !== d.pushed_rev || (d.up_tag || '') !== (d.pushed_tag || '') || d.updated_at !== d.srv);
@@ -379,7 +386,7 @@ async function syncNow() {
         if (d.rev === rev && d.rtag === tag) {
           if (d.up_tag && d.up_tag !== tag && d.up_tag !== (d.pushed_tag || '')) await dropObj(u, d, objName(u, d, d.up_tag));      // a file sent for a version that never got its entry
           d.up_rev = rev; d.up_tag = tag;
-        }
+        } else await dropObj(u, d, objName(u, d, tag));          // the pages changed while this file went up: nothing names it
         upFail.delete(d.id); persist();                           // progress survives the app being closed
       } catch (e) {
         upFailed++; upWhy = errText(e);
@@ -424,7 +431,7 @@ async function syncNow() {
         if (gone) d.cloudPurged = true;
       } catch (e) {}
     }
-    for (const d of docs) if (d.owed && d.owed.length) for (const name of d.owed.slice()) { if (stop()) return; await dropObj(u, d, name); }      // objects whose removal failed before
+    for (const d of docs) if (d.owed && d.owed.length) for (const name of d.owed.slice()) { if (stop()) return; const f = owedFail.get(name); if (f && Date.now() < f.until) continue; await dropObj(u, d, name); }      // objects whose removal failed before, each after its pause
     if (stop()) return;
     try { localStorage.setItem(okKey(), String(Date.now())); } catch (e) {}
     if (!(await persist())) throw new Error('The document list could not be saved.');

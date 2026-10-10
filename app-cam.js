@@ -85,7 +85,7 @@ function stopCamera() {
 // it, so the picture never stutters. Drawing runs with every screen refresh and glides the outline
 // toward the latest result, so it moves smoothly instead of jumping from find to find.
 function startDetWorker() {
-  if (detWorker || !self.Worker || !self.OffscreenCanvas || !self.createImageBitmap) return;
+  if (detWorker || !self.Worker || !self.OffscreenCanvas || !self.createImageBitmap || swTookOver) return;      // after a release took over: no worker from the other release
   try {
     detWorker = new Worker('worker.js');
     detWorker.onmessage = e => { const p = detPending.get(e.data.id); if (!p) return; detPending.delete(e.data.id); if (e.data.ok) p.res(e.data); else p.rej(new Error(e.data.error)); };

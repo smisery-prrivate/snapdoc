@@ -12,11 +12,11 @@ function holdInstance(opts) {                       // resolves true once this i
     let held = false;
     navigator.locks.request(INSTANCE_LOCK, opts, lock => {
       if (!lock) { resolve(false); return; }
-      held = true;
-      try { localStorage.setItem(OWNER_KEY, INSTANCE_ID); } catch (e) { markNeeded = true; }
+      held = true; lockHeld = true;
+      try { localStorage.setItem(OWNER_KEY, INSTANCE_ID); } catch (e) {}
       startAlive(); resolve(true);
       return new Promise(rel => { instanceRelease = rel; });
-    }).catch(() => { if (held) instanceLost(); else resolve(false); });      // taken over by another window, or never granted
+    }).catch(() => { lockHeld = false; if (held) instanceLost(); else resolve(false); });      // taken over by another window, or never granted
   });
 }
 function askHolder() {                              // is the instance that holds the lock in front of the user? true / false / null (no answer)
@@ -43,14 +43,21 @@ function waitForRelease() {
 }
 // the other window says "busy" while it finishes; without messages its alive stamp (once a second,
 // and before a long job on its main thread) still says it is there
-const waitBusy = ms => new Promise(r => { if (!bc) { r(); return; } let t = setTimeout(done, ms); const on = e => { if (e.data && e.data.t === 'busy') { clearTimeout(t); t = setTimeout(done, 4000); } }; function done() { bc.removeEventListener('message', on); r(); } bc.addEventListener('message', on); });
+let released = false;                                                     // the holder said it let go
+const waitBusy = ms => new Promise(r => { if (!bc) { r(); return; } let t = setTimeout(done, ms); const on = e => { if (!e.data) return; if (e.data.t === 'released') { released = true; done(); } else if (e.data.t === 'busy') { clearTimeout(t); t = setTimeout(done, 4000); } }; function done() { bc.removeEventListener('message', on); r(); } bc.addEventListener('message', on); });
 async function acquireInstance(force) {
   if (!navigator.locks) {                                                   // older browsers: the same hand-shake over messages, then the mark alone decides
     if (!force && (await askHolder()) === true) return false;
+    released = false;
     if (bc) { bc.postMessage({ t: 'yield', from: INSTANCE_ID }); await waitBusy(1500); }
-    const t0 = Date.now(); while (aliveAge() < 30000 && Date.now() - t0 < 120000) await waitBusy(2000);      // alive but silent: given time
-    try { localStorage.setItem(OWNER_KEY, INSTANCE_ID); } catch (e) { markNeeded = true; }
-    instanceRelease = () => {};                                             // the hand-shake stays answered from this side too
+    const t0 = Date.now(); let shown = false;
+    while (!released && aliveAge() < 30000 && Date.now() - t0 < 120000) {    // alive but silent: given time, and the screen says so
+      if (!shown) { shown = true; awayNote('The other window is finishing its scans. Snapdoc opens here as soon as they are stored.'); $('away').hidden = false; }
+      await waitBusy(2000);
+    }
+    if (shown) { $('away').hidden = true; awayNote(AWAY_TEXT); }
+    try { localStorage.setItem(OWNER_KEY, INSTANCE_ID); } catch (e) {}
+    instanceRelease = () => {}; lockHeld = true;                           // the hand-shake stays answered from this side too
     startAlive(); return true;
   }
   if (await holdInstance({ ifAvailable: true })) return true;
@@ -72,7 +79,7 @@ function showAway() {
   $('toast').classList.remove('show'); $('away').hidden = false;
 }
 function stopEverything() { try { stopCamera(); } catch (e) {} clearTimeout(syncTimer); }
-function instanceLost() { if (passive) return; passive = true; showAway(); stopEverything(); abortSync(); stepAside(); }
+function instanceLost() { if (passive) return; passive = true; lockHeld = false; clearInterval(aliveTimer); try { localStorage.removeItem(ALIVE_KEY); } catch (e) {} showAway(); stopEverything(); abortSync(); stepAside(); }
 async function yieldInstance() {                    // another window takes over: finish what is in flight, then let go
   showAway();
   const t0 = Date.now(); let said = 0;
@@ -87,8 +94,10 @@ async function yieldInstance() {                    // another window takes over
     await new Promise(r => setTimeout(r, 100));
   }
   try { await persistChain; } catch (e) {}
-  passive = true; stopEverything(); clearInterval(aliveTimer);
+  passive = true; lockHeld = false; stopEverything(); clearInterval(aliveTimer);
+  try { localStorage.removeItem(ALIVE_KEY); } catch (e) {}                 // no stale stamp keeps the other window waiting
   if (instanceRelease) { instanceRelease(); instanceRelease = null; }
+  if (bc) bc.postMessage({ t: 'released', from: INSTANCE_ID });
   stepAside();
 }
 if (bc) bc.addEventListener('message', e => {
@@ -135,7 +144,7 @@ function swSwitch() {
 // called after navigation and after background work: apply a waiting update when nothing is going on
 function afterNav() {
   if (!updateReady || locked || passive || !Vault.isOpen()) return;
-  if (current() !== 'home' || stack.length > 1 || workInFlight() || Vault.lockType() || persistQueued || persistFailed) return;      // with a lock it arrives with the restart of the lock instead
+  if (current() !== 'home' || stack.length > 1 || workInFlight() || (Vault.lockType() && !swTookOver) || persistQueued || persistFailed) return;      // with a lock it arrives with the restart of the lock instead, unless another window switched already: then this page runs on a cache that is gone
   persistChain.then(async () => { if (persistFailed || workInFlight() || current() !== 'home') return; await swSwitch(); location.reload(); });
 }
 
@@ -146,14 +155,15 @@ async function boot() {
   let h = location.hash || ''; if (!h) { try { h = sessionStorage.getItem(LINKHASH_KEY) || ''; sessionStorage.removeItem(LINKHASH_KEY); } catch (e) {} }      // a link that landed in a window which then stepped aside
   try {
     const qs = new URLSearchParams(location.search), code = qs.get('code');
-    if (code) { tokens = { code }; qs.delete('code'); const rest = qs.toString(); search = rest ? '?' + rest : ''; }      // the PKCE form of the sign-in link: a one-time code in the query
+    const sentence = c => c === 'otp_expired' ? 'This sign-in link has expired or was already used. Request a new one in the menu.' : c === 'access_denied' ? 'The sign-in link was refused. Request a new one in the menu.' : 'The sign-in link could not be used. Request a new one in the menu.';      // a few fixed sentences: never the sender's own text
+    if (code) tokens = { code };                                                                     // the PKCE form of the sign-in link: a one-time code in the query
+    else if (qs.get('error') || qs.get('error_code')) linkMsg = sentence(qs.get('error_code') || qs.get('error'));      // the PKCE form of a refused link
+    for (const k of ['code', 'error', 'error_code', 'error_description']) qs.delete(k);
+    const rest = qs.toString(); search = rest ? '?' + rest : '';
     const qp = new URLSearchParams(h.slice(1));
     if ((qp.get('state') || '').startsWith(DRIVE_STATE + '.')) driveQp = qp;                       // back from Google (Drive copies)
     else if (!tokens && qp.get('access_token') && qp.get('refresh_token')) tokens = { access_token: qp.get('access_token'), refresh_token: qp.get('refresh_token') };
-    else if (qp.get('error') || qp.get('error_code')) {                                             // a few fixed sentences: never the sender's own text
-      const code = qp.get('error_code') || qp.get('error');
-      linkMsg = code === 'otp_expired' ? 'This sign-in link has expired or was already used. Request a new one in the menu.' : code === 'access_denied' ? 'The sign-in link was refused. Request a new one in the menu.' : 'The sign-in link could not be used. Request a new one in the menu.';
-    }
+    else if (!linkMsg && (qp.get('error') || qp.get('error_code'))) linkMsg = sentence(qp.get('error_code') || qp.get('error'));
   } catch (e) {}
   history.replaceState(histState(), '', location.pathname + search);
   applyStack(); startWorker();

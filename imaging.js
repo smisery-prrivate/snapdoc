@@ -885,7 +885,7 @@
       const cr = (b[0] - a[0]) * (c[1] - b[1]) - (b[1] - a[1]) * (c[0] - b[0]), s = cr > 0 ? 1 : cr < 0 ? -1 : 0;
       if (!s || (sign && s !== sign)) return false; sign = s;
     }
-    return Math.abs(quadArea(q)) > 4;
+    return quadArea(q) > 4;                            // and in the stored order (top-left, top-right, bottom-right, bottom-left): the mirrored order would store a mirror image
   };
   IMG.warp = function (src, quad, opts) {
     opts = opts || {};

@@ -3,7 +3,7 @@ if (self !== top) { try { document.documentElement.hidden = true; } catch (e) {}
 /* Snapdoc core: helpers, settings, encrypted storage, the document model, the processing
    queue, screens and the back button. The app is several plain script files that share one
    scope (no build step); index.html loads them in order. */
-const VERSION = 'v13';
+const VERSION = 'v14';
 const $ = id => document.getElementById(id);
 const IMG = self.SnapdocImaging;
 const CFG = self.APP_CONFIG || {};
@@ -28,8 +28,8 @@ const INSTANCE_ID = uid(), BOOT_ID = INSTANCE_ID.slice(0, 8);
 let passive = false;
 // markNeeded: another window has shown itself (or the mark could not be written): from then on a
 // mark that cannot be read counts as "not the owner", never as a free pass
-let markNeeded = false;
-const isOwner = () => { try { const o = localStorage.getItem(OWNER_KEY); return !o || o === INSTANCE_ID; } catch (e) { return !markNeeded; } };
+let markNeeded = false, lockHeld = false;      // lockHeld: this window holds the Web Lock, which alone decides where the mark cannot be read
+const isOwner = () => { try { const o = localStorage.getItem(OWNER_KEY); return !o || o === INSTANCE_ID; } catch (e) { return lockHeld || !markNeeded; } };
 function writeGuard() {
   if (!passive && isOwner()) return;
   if (!passive && typeof instanceLost === 'function') instanceLost();
@@ -199,7 +199,11 @@ async function resealAll() {
               return ch ? cur : undefined;
             });
             mark.last[store] = id; if (++n % 20 === 0) await idb.put('meta', mark).catch(() => {});
-          } catch (e) { failed++; break outer; }                    // the mark stays before this record: the next run tries it again, the old keys wait
+          } catch (e) {                                           // the mark stays before this record: the next run tries it again; after three failures it is counted as lost, not blocking
+            mark.tries = mark.tries || {}; const k = store + '/' + id; mark.tries[k] = (mark.tries[k] || 0) + 1;
+            if (mark.tries[k] >= 3) { lost++; mark.last[store] = id; continue; }
+            failed++; break outer;
+          }
         }
       }
       try { await idb.put('meta', mark); } catch (e) {}
@@ -329,7 +333,7 @@ async function purgeDocData(d, pages) {
 // ---------- worker: processing off the main thread, inline fallback ----------
 let worker = null, seq = 0; const pending = new Map();      // pending: id -> { res, rej, msg } (msg kept for a retry on a fresh worker)
 function startWorker() {
-  if (!self.Worker || !self.OffscreenCanvas) return;
+  if (!self.Worker || !self.OffscreenCanvas || swTookOver) return;      // after a release took over, a new worker would come from the other release: the main thread does the work until the restart
   try {
     worker = new Worker('worker.js');
     worker.onmessage = e => { const p = pending.get(e.data.id); if (!p) return; pending.delete(e.data.id); e.data.ok ? p.res(e.data) : p.rej(new Error(e.data.error)); };
@@ -372,7 +376,8 @@ function replaceTop(name) { leave(stack.pop()); stack.push(name); history.replac
 let navPending = 0; const navQueue = [];
 const afterPop = fn => { if (navPending) navQueue.push(fn); else fn(); };
 // close the document screen of d, whatever lies on top of it, exactly once
-function closeDocView(d) { afterPop(() => { if (curDoc === d && stack.includes('doc') && !navPending) { navPending++; history.go(-(stack.length - stack.indexOf('doc'))); } }); }
+function closeDocView(d) { const go = () => { if (locked) { navQueue.push(go); return; } if (curDoc === d && stack.includes('doc') && !navPending) { navPending++; history.go(-(stack.length - stack.indexOf('doc'))); } }; afterPop(go); }      // under the lock screen it waits for the unlock
+function drainNav() { const q = navQueue.splice(0); for (const fn of q) fn(); }
 const lockTop = () => { const t = stack[stack.length - 1]; return t === 'popup' || t === 'sheet'; };      // under the lock screen only its own popup (and the menu) may close
 function back() { if (navPending || (locked && !lockTop())) return; if (stack.length > 1) { navPending++; history.back(); } }
 function leave(name) {
@@ -389,17 +394,17 @@ function leave(name) {
 window.addEventListener('popstate', e => {
   const st = e.state; navPending = 0;
   if (/[#&](access_token|error|error_code)=/.test(location.hash)) { linkOpened(); return; }   // a sign-in link was opened in this very tab: handled by a fresh start once nothing is in flight
-  if (locked && !lockTop()) { history.pushState(histState(), ''); return; }                    // Back under the lock screen closes nothing
+  if (locked && !lockTop()) { history.pushState(histState(), ''); drainNav(); return; }       // Back under the lock screen closes nothing
   if (!st || st.b !== BOOT_ID) {        // an entry from before a restart: Back still closes exactly one level
     if (stack.length > 1) { leave(stack.pop()); history.replaceState(histState(), ''); applyStack(); renderAll(); }
     else history.back();
-    return;
+    drainNav(); return;
   }
   const depth = st.n || 1;
   if (depth > stack.length) { history.go(stack.length - depth); return; }      // the browser's Forward button: back to the entry that matches the screens
   while (stack.length > depth && stack.length > 1) leave(stack.pop());
   applyStack(); renderAll(); afterNav();
-  while (navQueue.length) navQueue.shift()();
+  drainNav();
 });
 function renderAll() { renderHome(); renderSyncLine(); if (current() === 'doc') renderDoc(); }
 
@@ -421,7 +426,8 @@ function popup(title, text, buttons, opts) {
 $('popup').addEventListener('click', e => { if (e.target === $('popup')) back(); });
 let toastTimer = null, toastAction = null, heldToast = ''; const toastQueue = [];
 // a message with a choice (Undo) is never cut short by a plain message: that one waits its turn
-function endToast(settle) { const t = $('toast'); clearTimeout(toastTimer); t.classList.remove('show'); const a = toastAction; toastAction = null; if (settle && a && a.expire) a.expire(); if (toastQueue.length) toast(toastQueue.shift()); }
+function endToast(settle) { const t = $('toast'); clearTimeout(toastTimer); t.classList.remove('show'); const a = toastAction; toastAction = null; if (settle && a && a.expire) a.expire(); if (settle) flushToast(); }
+function flushToast() { if (toastQueue.length && !toastAction && !$('toast').classList.contains('show')) toast(toastQueue.shift()); }      // the next waiting message, once nothing is on screen
 // a pending Undo (or similar) is settled now, before something else changes the document
 function settleToast() { endToast(true); }
 function toast(msg, action) {
@@ -432,7 +438,7 @@ function toast(msg, action) {
   if (toastAction && toastAction.expire) toastAction.expire();
   toastAction = action || null;
   t.innerHTML = ''; t.appendChild(document.createTextNode(msg));
-  if (action) { const b = document.createElement('button'); b.textContent = action.label; b.addEventListener('click', () => { endToast(false); action.fn(); }); t.appendChild(b); }
+  if (action) { const b = document.createElement('button'); b.textContent = action.label; b.addEventListener('click', () => { endToast(false); action.fn(); flushToast(); }); t.appendChild(b); }      // what the action says comes first; a waiting message follows it
   t.classList.add('show');
   toastTimer = setTimeout(() => endToast(true), action ? 6000 : 2800);
 }

@@ -135,7 +135,7 @@ const Vault = (() => {
   // Turn on a lock whose key (k) only the PIN or the screen lock can produce.
   async function enableKeyLock(lock, k, aad) {
     const hadFile = !!(rec.device && rec.device.opfs);
-    const withBox = async raw => ({ lock: Object.assign({}, lock, { box: await sealWith(k, raw, aad) }), device: null, dirty: false });
+    const withBox = async (raw, fileLeft) => ({ lock: Object.assign({}, lock, { box: await sealWith(k, raw, aad) }), device: null, dirty: false, fileLeft: !!fileLeft });
     if (rec.dirty || !hadFile) {
       await rotate(withBox);
       if (hadFile && !(await boxRemove())) { try { await commit(copyRec({ fileLeft: true })); } catch (e) {} }      // the old key file is remembered and removed later
@@ -143,9 +143,9 @@ const Vault = (() => {
     }
     // clean install: store the lock first (both ways in still work), then remove the file for good.
     // Once the lock is stored the set-up has succeeded: a refused clean-up write leaves both ways
-    // in, and the step after the next unlock finishes it.
+    // in, and the step after the next unlock finishes it. A file that could not be removed is remembered.
     await commit(copyRec({ lock: Object.assign({}, lock, { box: await sealWith(k, LKraw, aad) }) }));
-    try { if (await boxRemove()) await commit(copyRec({ device: null })); else await rotate(withBox); } catch (e) {}
+    try { if (await boxRemove()) await commit(copyRec({ device: null })); else await rotate(raw => withBox(raw, true)); } catch (e) {}
   }
   // after a PIN / screen-lock unlock: finish a lock set-up that was interrupted, or renew a key
   // whose older copy may still linger in storage
@@ -153,9 +153,9 @@ const Vault = (() => {
     await loadOlds();
     if (rec.fileLeft && !rec.device && await boxRemove()) await commit(copyRec({ fileLeft: false }));
     if (!rec.device && !rec.dirty) return;
-    const gone = rec.device && rec.device.opfs ? await boxRemove() : false;
+    const hadFile = !!(rec.device && rec.device.opfs), gone = hadFile ? await boxRemove() : false;
     if (rec.device && gone && !rec.dirty) { await commit(copyRec({ device: null })); return; }
-    await rotate(async raw => ({ lock: Object.assign({}, rec.lock, { box: await sealWith(k, raw, aad) }), device: null, dirty: false }));
+    await rotate(async raw => ({ lock: Object.assign({}, rec.lock, { box: await sealWith(k, raw, aad) }), device: null, dirty: false, fileLeft: hadFile && !gone }));
   }
 
   // ---------- WebAuthn (fingerprint / screen lock) ----------

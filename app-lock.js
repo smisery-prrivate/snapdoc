@@ -46,6 +46,7 @@ async function tryUnlock() {
     $('lock').hidden = true; $('pinInput').value = ''; $('lockErr').textContent = '';
     while (unlockWaiters.length) unlockWaiters.shift()();
     if (heldToast) { const m = heldToast; heldToast = ''; toast(m); }
+    drainNav();                                                    // a close that waited under the lock
     resumeCam(); syncNow(); resealAll();
   } catch (e) {
     if (my === unlockSeq) $('lockErr').textContent = e && (e.name === 'NotAllowedError' || e.name === 'AbortError') ? 'Not unlocked. Tap Unlock to try again.' : (e && e.message) || 'Not unlocked.';
@@ -93,8 +94,9 @@ async function restartLocked(soft) {
       restarting = false; setTimeout(() => restartLocked(soft), 5000); return;
     }
     if (typing()) { restarting = false; return; }
-    try { sessionStorage.setItem(RESUME_KEY, resume ? resume.id : ''); if (editState) sessionStorage.setItem(EDIT_KEY, JSON.stringify(editState)); } catch (e) {}      // written only right before the restart
     await swSwitch();                                              // a release that waits is switched in now: the restart lands in it
+    if (typing()) { restarting = false; return; }
+    try { sessionStorage.setItem(RESUME_KEY, resume ? resume.id : ''); if (editState) sessionStorage.setItem(EDIT_KEY, JSON.stringify(editState)); } catch (e) {}      // written only right before the restart
     reloadPage();
   } catch (e) { restarting = false; }
 }

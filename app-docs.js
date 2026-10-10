@@ -265,10 +265,10 @@ async function pageAction(a, p) {
   else if (a === 'edit') openEdit(p);
   else if (a === 'del') {
     if (d.pages.length <= 1) { confirmDeleteDoc(d, 'This is the only page. Delete the document?'); return; }
-    d.pages.splice(i, 1); selPage = null; pendingDel.add(p.id); touchContent(d); save(); renderDoc(); renderHome();
+    d.pages.splice(i, 1); selPage = null; pendingDel.add(p.id); touchContent(d); const stored = save(); renderDoc(); renderHome();
     const tag = d.rtag;                                             // the version the page was removed from
     let settled = false;
-    const drop = () => { pendingDel.delete(p.id); if (!persistFailed) idb.del('pages', p.id).catch(() => {}); dropPrev(p.id); };      // with the list unsaved the record stays for the sweep
+    const drop = () => { pendingDel.delete(p.id); dropPrev(p.id); stored.then(ok => { if (ok) idb.del('pages', p.id).catch(() => {}); }); };      // the record goes only once the list without it is on disk; otherwise the sweep finds it
     toast('Page removed', { label: 'Undo',
       fn: () => {                                                   // the page goes back into whatever the document has become, and says so when that is not its old place
         if (settled) return; settled = true;

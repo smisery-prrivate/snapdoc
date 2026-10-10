@@ -18,10 +18,21 @@ create table if not exists public.sd_documents (
 create index if not exists sd_documents_user_synced on public.sd_documents (user_id, synced_at);
 
 -- the server stamps every write; devices ask for "everything stamped after my last visit"
+create sequence if not exists public.sd_stamp;
+-- the sequence starts above every stamp ever written (installs from before version 13 used milliseconds since 1970)
+do $$
+declare m bigint;
+begin
+  select coalesce(max(synced_at), 0) into m from public.sd_documents;
+  if (select last_value from public.sd_stamp) < greatest(m, (extract(epoch from clock_timestamp()) * 1000)::bigint) then
+    perform setval('public.sd_stamp', greatest(m, (extract(epoch from clock_timestamp()) * 1000)::bigint) + 1000, false);
+  end if;
+end $$;
+
 create or replace function public.sd_touch() returns trigger
 language plpgsql set search_path = public as $$
 begin
-  new.synced_at := (extract(epoch from clock_timestamp()) * 1000)::bigint;
+  new.synced_at := nextval('public.sd_stamp');      -- a sequence: it never steps back, unlike a clock
   return new;
 end $$;
 drop trigger if exists sd_documents_touch on public.sd_documents;

@@ -140,8 +140,9 @@ Everything is encrypted with AES-256-GCM, all in `vault.js` (WebCrypto, no libra
   device that is still set up can set a new one. A lost lock means *Reset this app* on that
   device; synced documents come back from the cloud, unsynced ones are gone.
 - **Nothing else leaves the device.** No cookies, no analytics, no third-party scripts or
-  fonts. A Content-Security-Policy in `index.html` allows connections to the app's own origin
-  and the one Supabase project only, and no inline script.
+  fonts. A Content-Security-Policy in `index.html` allows connections to the app's own origin,
+  the one Supabase project and, for the Drive copies the user connects, the two Google endpoints
+  only, and no inline script.
 - **The page refuses to run inside another site's frame.** Storage is per origin and modern
   browsers partition it for frames, but the page hides itself and stops when framed, so nothing
   can be overlaid on it.
@@ -247,9 +248,9 @@ The script files share one scope and load in the order above. There is no build 
   afterwards; an interruption leaves only records nothing refers to, and a delete that was
   interrupted is finished at the next start. The question "delete this document?" describes the
   document as it is; an answer to a question about one page deletes nothing once more pages are
-  there. A document deleted on another device while the camera or the view is on it: the view and
-  the camera close with the reason; pages that only this device has (being scanned, waiting to
-  join a download) live on in a new document and the camera continues there.
+  there. A document deleted on another device while the camera or the view is on it: the view
+  closes with the reason; the camera stays open and continues in a new document (with the pages
+  that only this device has, if any), its count starting again.
 - **A PDF is built from a snapshot** of the page list, name and page size; a page removed during
   the build cannot make the file skip another one. If the document changed during the build, the
   PDF is built again, and two callers for the same version share one build.
@@ -275,8 +276,10 @@ The script files share one scope and load in the order above. There is no build 
   Every object this device no longer needs in the bucket (a replaced version, the version that
   lost a conflict, a file whose entry was never accepted) is removed, or remembered on the
   document and removed on a later pass; a delete marker is kept until nothing is owed any more.
-- Signing in with another account, or signing out, resolves documents that were still waiting for
-  a version from the old cloud: the pages this device holds become a version of their own.
+- Signing in with another account resolves documents that were still waiting for a version from
+  the old cloud: the pages this device holds become a version of their own. Signing out keeps
+  every cloud mark, so that the same account can come back and the cloud's newer versions still
+  win; a document that was waiting for a download stays "downloading" until then.
 - One document that cannot be uploaded (too large, a page missing) or whose entry cannot be
   saved is named in the status and does not hold up the others. A refused upload is tried again
   after a growing pause (1 min, 4 min, 16 min, ... up to an hour), not on every pass; "Sync now"
@@ -306,9 +309,9 @@ The script files share one scope and load in the order above. There is no build 
 
 The service worker stores one complete release, fetched past the browser's HTTP cache in one go.
 The app starts from that set without waiting for the network. A new release arrives as a new
-worker; when it has taken over, the page restarts at a quiet moment (with a lock set: at the next
-unlock). A release with a missing file is never activated. The page therefore never runs a mix
-of two versions.
+worker that waits; the page asks for the switch and restarts at a quiet moment (with a lock set:
+with the restart of the lock). A release with a missing file is never activated. The page
+therefore never runs a mix of two versions.
 
 ## Housekeeping
 
@@ -387,6 +390,8 @@ and do not fork copies.
 - v12: the document view, the camera, the lock screen and the start-up: fixes for the remaining
   findings of review round 2 (see `REVIEW.md`); database version 2; the stored crop starts from
   the outline the camera showed; a message never catches a tap meant for what lies under it.
+- v14: fixes for the 17 findings of the regression check on v13 (see `REVIEW.md`); the sequence
+  stamp is part of `supabase-schema.sql`, which is safe to run again.
 - v13: fixes for all 87 findings of review round 3 (see `REVIEW.md`): sync (fresh file names on
   revival, keyset pull, owed objects, equal stamps, account in the list, abort signal, PKCE sign-in,
   the server stamp as a sequence: run `supabase-migration-v13.sql` once), vault and lock, the

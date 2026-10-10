@@ -272,3 +272,29 @@ version 13; the reviewers' files are in `_preview/review/r3-*.md`.
 | The page could be framed by another site. | The page hides itself and stops when framed. |
 
 Tests: `t18-r3.js` (two devices through the revival, the legacy entry, equal stamps, keyset pull, sign-out, the batch delete, Undo under a message, the refused clean-up write, the covered restart, the hand-over without Web Locks, the PKCE link, the Forward button), `t19-imaging.js` (node: the hint onto another aspect, unusable quads, the PDF round trip with a non-ASCII title and a five-byte page, the empty-page rule, byte scanning); every earlier suite re-run, five of them adapted to the changed behaviour.
+
+# Regression check on version 13 (2026-10-10)
+
+One reviewer traced all 87 round-3 findings in version 13: 68 hold, 17 partly, 2 not. 17 new
+findings (1 high, 3 medium, 13 low), all fixed in version 14. Reviewer file: `_preview/review/r4-regress.md`.
+
+| Found | Changed in version 14 |
+| --- | --- |
+| Signing out resolved waiting documents into versions of their own but kept the cloud marks: a later sign-in with the same account pushed the stale pages over the newer cloud version everywhere and deleted a never-downloaded document everywhere. | Signing out keeps everything as it is; only a sign-in with another account resolves (its marks are reset first), and a document with nothing here is dropped instead of marked deleted. |
+| A browser whose localStorage refuses could not write at all: the failed mark write set "mark needed" and every write was refused as "active in another window". | The mark is required only once another window has shown itself; a window that holds the Web Lock is the owner whatever the mark says. |
+| Without Web Locks every hand-over waited half a minute after the holder had let go, with a blank screen; a window that lost the instance kept stamping "alive". | The holder removes its stamp and says "released"; the newcomer ends its wait on that; the stamp stops on every way out; the screen says what is waited for. |
+| Equal change stamps with two names: with an upload refused for good, two devices re-sent their entries against each other on every pass. | The tie is decided by the name alone, which both devices see alike. |
+| Objects still orphaned: a version that changed during its own upload, and the file of a version whose entry was never accepted at the two revival branches. | Removed, or remembered as owed, in all three places; owed removals back off like refused uploads. |
+| A message waiting behind Undo was shown for a blink when the Undo's own action put up a message. | What the action says comes first; the waiting message follows once nothing is on screen. |
+| A mirrored corner order passed the quad check: the page was stored as a mirror image. | The stored order is required. |
+| Two of the three renewal paths after a failed key-file removal forgot the file. | All three remember it. |
+| A refused PKCE link lands with its error in the query: no message, the error stayed in the address. | Read from the query as well, the same fixed sentences, the address cleaned. |
+| An install upgraded while signed in kept no account inside the list; the next sign-in still decided by the plain key. | The signed-in account moves into the list at the first start. |
+| Three CONCEPT sentences described what the code does not do; the schema file still installed the clock stamp and would undo the migration. | Reworded; the sequence stamp lives in the schema file, which seeds it and is safe to run again; the migration file is a pointer. |
+| The restart of the lock wrote its marks before the switch to the waiting release and did not look at the PIN again after it; the "took over" flag was never read. | The switch first, the PIN check repeated, then the marks; after a take-over no new worker is made and the page restarts at the next quiet moment even with a lock. |
+| The page record went while the list write that detached the page was still in flight, or after an unrelated failure. | The record goes only once that very write has landed. |
+| Owed removals were retried on every pass without a pause. | Each name backs off like a refused upload. |
+| A record that kept failing for any other reason than a missing key stopped the re-encryption pass for good, silently. | After three attempts it is counted as lost and reported once; the pass goes on. |
+| A close queued for a pending step was dropped when the next step came under the lock or from an entry before the restart. | Every branch drains the queue; a close under the lock waits for the unlock. |
+
+Tests: `t20-r4.js` (sign out and in again with the same account, the name tie with a refused upload, a browser whose localStorage refuses, the no-locks hand-over without the half-minute wait, a refused PKCE link, the message after Undo's own message); `t19-imaging.js` (the mirrored order); every earlier suite re-run.

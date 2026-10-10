@@ -874,10 +874,24 @@
     }
     return gauss(A, B);
   }
+  // a quad is usable only as a simple convex shape with a real area: mirrored or self-crossing
+  // corners would turn the picture inside out
+  IMG.quadUsable = function (q) {
+    if (!Array.isArray(q) || q.length !== 4) return false;
+    let sign = 0;
+    for (let i = 0; i < 4; i++) {
+      const a = q[i], b = q[(i + 1) % 4], c = q[(i + 2) % 4];
+      if (!a || !isFinite(a[0]) || !isFinite(a[1])) return false;
+      const cr = (b[0] - a[0]) * (c[1] - b[1]) - (b[1] - a[1]) * (c[0] - b[0]), s = cr > 0 ? 1 : cr < 0 ? -1 : 0;
+      if (!s || (sign && s !== sign)) return false; sign = s;
+    }
+    return Math.abs(quadArea(q)) > 4;
+  };
   IMG.warp = function (src, quad, opts) {
     opts = opts || {};
     const maxSide = opts.maxSide || 2000;
     const dist = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1]);
+    if (!IMG.quadUsable(quad)) { const sz = sizeOf(src); quad = IMG.fullQuad(sz.w, sz.h); }      // never a mirrored or crossing cut: the whole picture instead
     const [tl, tr, br, bl] = quad;
     let W = Math.max(dist(tl, tr), dist(bl, br)), H = Math.max(dist(tl, bl), dist(tr, br));
     const sc = Math.min(1, maxSide / Math.max(W, H));
@@ -1216,6 +1230,7 @@
     const obj = (num, body) => { offs[num] = pos; put(num + ' 0 obj\n' + body + '\nendobj\n'); };
     put('%PDF-1.4\n'); put(new Uint8Array([0x25, 0xE2, 0xE3, 0xCF, 0xD3, 0x0A]));
     const n = pages.length, sizes = { A4: [595.28, 841.89], Letter: [612, 792] }, ps = opts.pageSize || 'A4';
+    for (const pg of pages) if (!pg.bytes || !pg.bytes.length) throw new Error('a page of this document is empty');      // never an empty image in a PDF: such a page could vanish on the way back
     const kids = []; for (let i = 0; i < n; i++) kids.push((3 + i * 3) + ' 0 R');
     obj(1, '<< /Type /Catalog /Pages 2 0 R >>');
     obj(2, '<< /Type /Pages /Kids [' + kids.join(' ') + '] /Count ' + n + ' >>');
@@ -1248,15 +1263,20 @@
     return out;
   };
   // Recover the JPEG pages from a PDF written by makePdf (or any PDF with plain DCTDecode images).
+  // The bytes are searched directly (a PDF of tens of megabytes is never copied into a string).
+  // An image with an empty stream is kept as a page: a page may fail to decode, but never vanishes.
   IMG.extractPdfJpegs = function (u8) {
-    const txt = new TextDecoder('latin1').decode(u8), out = []; let p = 0;
-    while ((p = txt.indexOf('/Subtype /Image', p)) !== -1) {
-      const sPos = txt.indexOf('stream', p); if (sPos === -1) break;
-      const dictStart = Math.max(0, txt.lastIndexOf(' obj', p));
-      const head = txt.slice(dictStart, sPos);
+    const find = (pat, from) => { const n = pat.length; outer: for (let i = from; i <= u8.length - n; i++) { for (let j = 0; j < n; j++) if (u8[i + j] !== pat.charCodeAt(j)) continue outer; return i; } return -1; };
+    const rfind = (pat, from) => { const n = pat.length; outer: for (let i = Math.min(from, u8.length - n); i >= 0; i--) { for (let j = 0; j < n; j++) if (u8[i + j] !== pat.charCodeAt(j)) continue outer; return i; } return -1; };
+    const latin = (a, b) => { let s = ''; for (let i = a; i < b; i++) s += String.fromCharCode(u8[i]); return s; };
+    const out = []; let p = 0;
+    while ((p = find('/Subtype /Image', p)) !== -1) {
+      const sPos = find('stream', p); if (sPos === -1) break;
+      const dictStart = Math.max(0, rfind(' obj', p));
+      const head = latin(dictStart, sPos);
       const len = +((/\/Length\s+(\d+)/.exec(head) || [])[1] || 0), w = +((/\/Width\s+(\d+)/.exec(head) || [])[1] || 0), h = +((/\/Height\s+(\d+)/.exec(head) || [])[1] || 0);
-      let ds = sPos + 6; if (txt[ds] === '\r') ds++; if (txt[ds] === '\n') ds++;
-      if (len > 0 && /DCTDecode/.test(head)) out.push({ bytes: u8.slice(ds, ds + len), w, h });
+      let ds = sPos + 6; if (u8[ds] === 13) ds++; if (u8[ds] === 10) ds++;
+      if (/DCTDecode/.test(head)) out.push({ bytes: u8.slice(ds, ds + len), w, h });
       p = ds + len;
     }
     return out;
@@ -1281,6 +1301,17 @@
     }
     return out;
   }
+  // The outline the camera showed, moved onto the photo. The live picture and the photo may differ
+  // in size and even in aspect (a sensor picture is wider or taller than the stream): one scale
+  // factor, centred, keeps the shape; same: the two show the same field of view, so the outline may
+  // stand in for a page the search does not find. hint: { quad, w, h } in live-picture pixels.
+  IMG.scaleHint = function (hint, sw, sh) {
+    if (!hint || !Array.isArray(hint.quad) || hint.quad.length !== 4 || !(hint.w > 0) || !(hint.h > 0)) return null;
+    const k = Math.min(sw / hint.w, sh / hint.h), ox = (sw - hint.w * k) / 2, oy = (sh - hint.h * k) / 2;
+    const quad = hint.quad.map(p => [p[0] * k + ox, p[1] * k + oy]);
+    if (!IMG.quadUsable(quad)) return null;
+    return { quad, same: Math.abs(Math.log((hint.w / hint.h) / (sw / sh))) < 0.03 };
+  };
   IMG.tasks = {
     // m: { blob, quad?, filter, rot, keepOrig, maxOrig, maxOut }
     async process(m) {
@@ -1289,10 +1320,10 @@
       const src = IMG.drawCapped(bmp, m.maxOrig || 2400); if (bmp.close) bmp.close();
       let quad = m.quad;
       if (!quad) {                                        // m.hint: the outline the camera showed (in the live picture's pixels): the search starts from it and falls back to it
-        let hint = null;
-        if (m.hint && Array.isArray(m.hint.quad) && m.hint.w > 0 && m.hint.h > 0) { const kx = src.width / m.hint.w, ky = src.height / m.hint.h; hint = m.hint.quad.map(p => [p[0] * kx, p[1] * ky]); }
-        let det = null; try { det = IMG.detectQuad(src, { prior: hint || undefined }); } catch (e) {}
-        quad = det ? IMG.insetQuad(det.quad, 0.012) : hint ? IMG.insetQuad(hint, 0.012) : IMG.fullQuad(src.width, src.height);
+        const hint = IMG.scaleHint(m.hint, src.width, src.height);
+        let det = null; try { det = IMG.detectQuad(src, { prior: hint ? hint.quad : undefined }); } catch (e) {}
+        if (det && det.borders >= 2) det = null;          // an outline with two sides on the frame border is no page, as the live view holds it
+        quad = det ? IMG.insetQuad(det.quad, 0.012) : hint && hint.same ? IMG.insetQuad(hint.quad, 0.012) : IMG.fullQuad(src.width, src.height);
       }
       let out = dress(IMG.warp(src, quad, { maxSide: m.maxOut || 2000 }), m.filter);
       if (m.rot) out = IMG.rotate(out, m.rot);
@@ -1310,9 +1341,10 @@
     async preview(m) {
       const src = IMG.drawCapped(m.bitmap, 1e9); if (m.bitmap.close) m.bitmap.close();
       let det = null; try { det = IMG.detectQuad(src, { prior: m.quad || undefined }); } catch (e) {}
-      const quad = det ? IMG.insetQuad(det.quad, 0.012) : IMG.fullQuad(src.width, src.height);
+      if (det && det.borders >= 2) det = null;
+      const quad = det ? IMG.insetQuad(det.quad, 0.012) : m.quad ? IMG.insetQuad(m.quad, 0.012) : IMG.fullQuad(src.width, src.height);      // the same fallback as "process": the outline, then the whole picture
       const out = dress(IMG.warp(src, quad, { maxSide: m.maxOut || 900 }), m.filter, { work: 224 });
-      return { jpeg: await IMG.toBlob(out, 'image/jpeg', 0.8), w: out.width, h: out.height };
+      return { jpeg: await IMG.toBlob(out, 'image/jpeg', 0.8), w: out.width, h: out.height, quad, sw: src.width, sh: src.height };
     },
     // Runs the preview once on a made-up page. The camera asks for this while it starts, so the
     // code is already compiled when the first real shot wants its picture at once.
@@ -1340,7 +1372,7 @@
       const pages = [];
       for (const im of IMG.extractPdfJpegs(u8)) {
         const blob = new Blob([im.bytes], { type: 'image/jpeg' });
-        const bmp = await createImageBitmap(blob);
+        let bmp; try { bmp = await createImageBitmap(blob); } catch (e) { throw new Error('a page in the file cannot be read'); }      // a damaged page fails the file, it never vanishes quietly
         const prev = await IMG.toBlob(IMG.drawCapped(bmp, PREV), 'image/jpeg', 0.8);
         const thumb = await IMG.dataUrl(IMG.drawCapped(bmp, THUMB), 'image/jpeg', 0.7);
         pages.push({ jpeg: blob, prev, thumb, w: bmp.width, h: bmp.height }); if (bmp.close) bmp.close();

@@ -142,6 +142,9 @@ Everything is encrypted with AES-256-GCM, all in `vault.js` (WebCrypto, no libra
 - **Nothing else leaves the device.** No cookies, no analytics, no third-party scripts or
   fonts. A Content-Security-Policy in `index.html` allows connections to the app's own origin
   and the one Supabase project only, and no inline script.
+- **The page refuses to run inside another site's frame.** Storage is per origin and modern
+  browsers partition it for frames, but the page hides itself and stops when framed, so nothing
+  can be overlaid on it.
 - **Shared web address.** All of the owner's GitHub Pages apps live on one origin, which
   browsers treat as one site: a script running in a sibling app could reach Snapdoc's storage.
   With a key-bound lock such a script cannot read the key silently; it could still ask the phone
@@ -155,7 +158,9 @@ Everything is encrypted with AES-256-GCM, all in `vault.js` (WebCrypto, no libra
 - Away longer than the chosen time, in front or in the background: locked again. When nothing is
   in flight the page restarts, which also clears the key and every decrypted image from memory.
 - Only work that ends by itself counts as in flight (pages processing, a rotation, a sync, a PDF
-  build, the share sheet or the photo picker in front of the app). A screen that is merely open
+  build, a queued list write, the share sheet or the photo picker in front of the app). When the
+  lock is due, the lock screen covers the app first, whatever follows; a restart whose final list
+  write fails keeps the cover up and tries again, and a PIN typed meanwhile is never thrown away. A screen that is merely open
   does not keep the key in memory: with the corners open or the camera running, the restart
   follows once the work is done, remembers the open document and the corners being adjusted
   (page, corner positions), and reopens them after the unlock. The restart waits while a PIN is
@@ -171,14 +176,19 @@ Everything is encrypted with AES-256-GCM, all in `vault.js` (WebCrypto, no libra
 
 ## One active window
 
-- A window asked to step aside finishes every shot first, however long that takes, and says
-  "busy" once a second meanwhile; the new window waits as long as it hears that and takes over
-  only from a window that stays silent, after asking once more who holds the instance. A window
-  with a lock that has stepped aside restarts without the key: nothing decrypted stays in its
-  memory until "Use Snapdoc here".
+- A window asked to step aside finishes every shot, crop, rotation and PDF build first, however
+  long that takes, and says "busy" once a second meanwhile; the new window waits as long as it
+  hears that. The window holding the instance also writes an "alive" stamp once a second (and
+  before a long job on its own thread), so a window that is busy but cannot answer is given time
+  too; a window is taken over only when it stays silent and its stamp is half a minute old. The
+  same hand-shake runs on browsers without Web Locks. A browser that cannot ask at all (no
+  BroadcastChannel) never takes over on its own: the user decides with "Use Snapdoc here". A
+  window with a lock that has stepped aside restarts without the key: nothing decrypted stays in
+  its memory until "Use Snapdoc here". A sign-in link that landed in such a window comes along.
 - The database is opened with a version number (2 since v12). A window still running an older
   release holds the old version open and cannot write beside the new one; the new window says so
-  and starts once that window is closed. Later versions step the old window aside by themselves.
+  and starts once that window is closed. Later versions step the old window aside by themselves,
+  once its shots are stored.
 - A sign-in link opened in the running app is taken off the address at once and handled by a
   fresh start as soon as nothing is in flight; a link nobody asked for from this browser does not
   take the app away from another window, and an error link shows only one of a few fixed
@@ -248,20 +258,36 @@ The script files share one scope and load in the order above. There is no build 
   whole photo.
 - **Name and deletion** follow the later change. A document deleted on one device and renamed
   later on another comes back whole: the renaming device uploads the file again.
-- The server stamps each write (`synced_at`); devices pull everything stamped after their last
-  visit, with a three-second overlap. Entries are idempotent. The bookmark of the last visit is
-  stored inside the encrypted document list, in the same write, so it can never be ahead of the
-  list it belongs to.
+- The server stamps each write (`synced_at`, a sequence since v13: it never steps back, unlike a
+  clock); devices pull everything stamped after their last visit, with a small overlap, in pages
+  keyed by stamp and id (never by offset, so a row rewritten meanwhile shifts nothing). Entries
+  are idempotent. The bookmark of the last visit and the account the list last synced with are
+  stored inside the encrypted document list, in the same write, so neither can be ahead of the
+  list or be read from outside it. Two entries with the same change stamp are decided alike on
+  every device: a delete beats a live change, then the larger revision, then the larger name. An
+  entry this device cannot read (written before entries were sealed, or damaged) is replaced by
+  this device's next write of that document.
 - Deletes are sealed markers and are written once. The files are removed from the bucket only
   after the cloud has confirmed that the marker is still the current entry; that removal is
   repeated until it succeeds. A document deleted on one device and brought back by a later change
-  on another is downloaded again; a device whose pages are the only ones left sends them again.
+  on another is downloaded again; a device whose pages are the only ones left sends them again,
+  under a fresh file name, so a purge still under way on the other device cannot remove them.
+  Every object this device no longer needs in the bucket (a replaced version, the version that
+  lost a conflict, a file whose entry was never accepted) is removed, or remembered on the
+  document and removed on a later pass; a delete marker is kept until nothing is owed any more.
+- Signing in with another account, or signing out, resolves documents that were still waiting for
+  a version from the old cloud: the pages this device holds become a version of their own.
 - One document that cannot be uploaded (too large, a page missing) or whose entry cannot be
   saved is named in the status and does not hold up the others. A refused upload is tried again
   after a growing pause (1 min, 4 min, 16 min, ... up to an hour), not on every pass; "Sync now"
   tries at once.
 - A pass stops as soon as the window is no longer the active one, the lock closes, the account
-  changes or the window is handed over; a running request is cut off then.
+  changes or the window is handed over; the request under way is cut off then (the requests carry
+  the pass's abort signal). A device whose clock is behind refreshes its session on a 401 and
+  repeats the request once.
+- The sign-in link is requested with a PKCE challenge and carries a one-time code that only this
+  browser (holding the verifier) can exchange; a copy of the address in a browser history is
+  worthless. Links in the older form (tokens in the fragment) are still accepted once.
 - A PDF is never built or uploaded with a page left out.
 - Every device downloads every PDF, so all documents are available offline.
 - Sync status is always visible on the home screen; failures show their reason in the menu.
@@ -269,6 +295,14 @@ The script files share one scope and load in the order above. There is no build 
   signed in, and the cloud confirms the token.
 
 ## Offline and updates
+
+- A new release installs and then **waits**. The page running the old release keeps its complete
+  set of files until it asks for the switch itself, at a quiet moment right before it restarts
+  (the home screen with nothing in flight, or the restart of the lock), so it never loads a file
+  of the new release. A release that took over anyway (another window asked for it) makes this
+  page restart at the next quiet moment. The restart of an update waits for the list write and
+  never leaves on a refused one. A device still running version 12 (whose worker switched at
+  once) gets version 13 the first time the app is opened after it was closed.
 
 The service worker stores one complete release, fetched past the browser's HTTP cache in one go.
 The app starts from that set without waiting for the network. A new release arrives as a new
@@ -285,6 +319,16 @@ of two versions.
 - Scans are stored at up to 2400 px on the long side, JPEG quality 0.82: about 200 dpi on A4.
 - If the browser does not promise to keep the stored data, the menu says so while scans exist
   only on this device.
+
+- **Honest limit of the Drive connection.** Google's reply carries the access token in the
+  address (the implicit grant; a static web app has no secret for the code flow). The app takes it
+  off the address at once, but the browser may already have recorded the visit in its history.
+  The token lives one hour and allows only the app's own Drive files. A reply nobody asked for is
+  ignored without a word; a reply with an error shows one of a few fixed sentences. The quiet
+  reconnect runs at most twice in ten minutes and only while nothing on the home screen would be
+  lost. One document Google refuses does not hold up the others (back-off per document, a file
+  removed in Drive is made again). PDFs over 5 MB go up in the resumable form. Two devices that
+  create the same file or folder at the same moment both keep the older one.
 
 ## Set-up of the Google Drive copies (once, by the owner)
 
@@ -343,6 +387,12 @@ and do not fork copies.
 - v12: the document view, the camera, the lock screen and the start-up: fixes for the remaining
   findings of review round 2 (see `REVIEW.md`); database version 2; the stored crop starts from
   the outline the camera showed; a message never catches a tap meant for what lies under it.
+- v13: fixes for all 87 findings of review round 3 (see `REVIEW.md`): sync (fresh file names on
+  revival, keyset pull, owed objects, equal stamps, account in the list, abort signal, PKCE sign-in,
+  the server stamp as a sequence: run `supabase-migration-v13.sql` once), vault and lock, the
+  document view, the camera, the hand-over, the service worker that waits, Drive, the imaging
+  arithmetic. The cloud account id, the last-sync time and the page records' write time are no
+  longer written readable.
 
 ## Tested, and not yet
 

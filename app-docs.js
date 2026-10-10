@@ -47,7 +47,7 @@ function renderHome() {
     // a long press starts the pick list with this document picked
     let t = null, x0 = 0, y0 = 0;
     const cancel = () => { clearTimeout(t); t = null; };
-    el.addEventListener('pointerdown', e => { x0 = e.clientX; y0 = e.clientY; cancel(); t = setTimeout(() => { t = null; if (!hasContent(d)) return; pressed = true; selectMode = true; selected.add(d.id); if (navigator.vibrate) navigator.vibrate(20); renderHome(); }, 450); });
+    el.addEventListener('pointerdown', e => { x0 = e.clientX; y0 = e.clientY; cancel(); pressed = false; t = setTimeout(() => { t = null; if (!hasContent(d)) return; pressed = true; setTimeout(() => { pressed = false; }, 600); selectMode = true; selected.add(d.id); if (navigator.vibrate) navigator.vibrate(20); renderHome(); }, 450); });
     el.addEventListener('pointermove', e => { if (t && Math.hypot(e.clientX - x0, e.clientY - y0) > 10) cancel(); });
     el.addEventListener('pointerup', cancel); el.addEventListener('pointercancel', cancel); el.addEventListener('pointerleave', cancel);
     el.addEventListener('contextmenu', e => e.preventDefault());
@@ -85,7 +85,8 @@ async function selAction(share) {
       return;
     }
     for (const f of files) { downloadBlob(f, f.name); await new Promise(r => setTimeout(r, 250)); }      // browsers without a share sheet (desktop): one file after the other
-    toast('Saved ' + files.length + (files.length === 1 ? ' PDF' : ' PDFs')); setSelectMode(false);
+    if (files.length === 1) { toast('Saved 1 PDF'); setSelectMode(false); }
+    else toast(files.length + ' PDFs handed to the browser. It may ask you to allow several downloads; the selection stays until you cancel it.');      // the browser may have blocked all but the first
   } catch (e) { toast('Could not build the PDFs: ' + errText(e)); }
   finally { selBusy = false; busy(false); renderHome(); }
 }
@@ -94,7 +95,7 @@ $('selDelete').addEventListener('click', () => {
   const list = [...selected].map(byId).filter(d => d && !d.deleted); if (!list.length) return;
   popup(list.length === 1 ? 'Delete this document?' : 'Delete ' + list.length + ' documents?', 'All their pages and PDFs are removed' + (SYNC && session ? ' here and in the cloud' : '') + '.', [
     // the lists are detached and stored first, then the records go: an interruption leaves only records nothing refers to
-    { label: 'Delete', cls: 'danger', fn: async () => { const gone = list.map(d => { const g = d.pages; d.pages = []; d.deleted = true; return g; }); save(); setSelectMode(false); renderAll(); toast(list.length === 1 ? 'Document deleted' : list.length + ' documents deleted'); } },
+    { label: 'Delete', cls: 'danger', fn: async () => { const gone = list.map(d => { const g = d.pages; d.pages = []; d.deleted = true; return g; }); const stored = save(); setSelectMode(false); renderAll(); if (await stored) { for (let k = 0; k < list.length; k++) await purgeDocData(list[k], gone[k]); persist(); } toast(list.length === 1 ? 'Document deleted' : list.length + ' documents deleted'); } },
     { label: 'Keep', cls: 'quiet' }]);
 });
 $('selSave').addEventListener('click', () => selAction(false));
@@ -207,10 +208,10 @@ function confirmDeleteDoc(d, title) {
     // the page list is detached and stored first, then the records go: an interruption leaves only records nothing refers to
     { label: 'Delete', cls: 'danger', fn: async () => {
       if (d.deleted || d.pages.length !== n || d.rev !== rev) { toast('The document changed meanwhile. Nothing was deleted.'); return; }
-      const gone = d.pages; d.pages = []; d.deleted = true; save();
-      if (curDoc === d && stack.includes('doc') && !navPending) { navPending++; history.go(-(stack.length - stack.indexOf('doc'))); }      // the camera on top of it goes too
+      const gone = d.pages; d.pages = []; d.deleted = true; const stored = save();
+      closeDocView(d);                                            // the camera on top of it goes too
       renderAll(); toast('Document deleted');
-      await persistChain; await purgeDocData(d, gone); persist();
+      if (await stored) { await purgeDocData(d, gone); persist(); }      // the records go only once the list without them is on disk; otherwise the sweep finds them later
     } },
     { label: 'Keep', cls: 'quiet' }]);
 }
@@ -229,6 +230,7 @@ async function replacePage(d, p, r, orig, meta) {
   const stored = await save();
   dropPrev(p.id); dropQuick(p.id);
   if (stored) idb.del('pages', p.id).catch(() => {});             // otherwise the old record stays until the sweep finds it unreferenced
+  else if (passive) toast('Not saved: Snapdoc is active in another window.');
   return true;
 }
 let rotChain = Promise.resolve();
@@ -266,7 +268,7 @@ async function pageAction(a, p) {
     d.pages.splice(i, 1); selPage = null; pendingDel.add(p.id); touchContent(d); save(); renderDoc(); renderHome();
     const tag = d.rtag;                                             // the version the page was removed from
     let settled = false;
-    const drop = () => { pendingDel.delete(p.id); idb.del('pages', p.id).catch(() => {}); dropPrev(p.id); };
+    const drop = () => { pendingDel.delete(p.id); if (!persistFailed) idb.del('pages', p.id).catch(() => {}); dropPrev(p.id); };      // with the list unsaved the record stays for the sweep
     toast('Page removed', { label: 'Undo',
       fn: () => {                                                   // the page goes back into whatever the document has become, and says so when that is not its old place
         if (settled) return; settled = true;
@@ -304,22 +306,22 @@ const pdfJobs = new Map();
 async function getPdf(d) {
   await waitForPages();
   const sig = pdfSig(d), key = d.id + '|' + sig;
-  if (pdfJobs.has(key)) return pdfJobs.get(key);
+  if (pdfJobs.has(key)) { const out = await pdfJobs.get(key); return out || getPdf(d); }      // a joiner retries like the builder when the build was stale
   const job = (async () => {
     const c = await pdfGet(d.id, sig).catch(() => null);
     if (c) return c.blob;
     const list = d.pages.filter(p => !p.status), title = (d.name || '').trim() || dateStamp(d.created_at), pageSize = settings.pageSize;
+    const changed = () => { const now = d.pages.filter(p => !p.status); return pdfSig(d) !== sig || now.length !== list.length || now.some((p, i) => p !== list[i]); };
     const pages = [];
     for (const p of list) {
       const rec = await pageGet(p.id, ['jpeg']);
-      if (!rec || !rec.jpeg) throw new Error('a page of this document is missing on this device');   // never build (or upload) a PDF with pages left out
+      if (!rec || !rec.jpeg) { if (changed() || !d.pages.includes(p)) return null; throw new Error('a page of this document is missing on this device'); }   // never build (or upload) a PDF with pages left out; a page replaced meanwhile means: build again
       pages.push({ blob: rec.jpeg, w: rec.w, h: rec.h });
     }
     if (!pages.length) throw new Error('no pages');
     const r = await task({ cmd: 'pdf', pages, title, pageSize });
-    const now = d.pages.filter(p => !p.status);
-    if (pdfSig(d) !== sig || now.length !== list.length || now.some((p, i) => p !== list[i])) return null;      // changed meanwhile: not this version's PDF
-    try { await pdfPut(d.id, sig, r.pdf); } catch (e) {}              // the cache is a convenience; the PDF is returned either way
+    if (changed()) return null;                                   // changed meanwhile: not this version's PDF
+    if (d.rev_have >= 0) { try { await pdfPut(d.id, sig, r.pdf); } catch (e) {} }      // the cache is a convenience; the PDF is returned either way (not cached while a newer version is on its way)
     return r.pdf;
   })();
   pdfJobs.set(key, job);
@@ -342,11 +344,13 @@ function downloadBlob(blob, name) {
   setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 4000);
 }
 async function savePdfLocal(d) {
+  if (!hasContent(d)) { toast(STILL_DOWNLOADING); return; }
   try { downloadBlob(await getPdf(d), fileName(d)); toast('Saved: ' + fileName(d)); } catch (e) { toast('Could not build the PDF: ' + errText(e)); }
 }
 let pdfBuilding = false;
 async function sharePdf(d) {
   if (pdfBuilding) return;
+  if (!hasContent(d)) { toast(STILL_DOWNLOADING); return; }
   if (!d.pages.some(p => !p.status)) { toast('No pages yet.'); return; }
   let blob; pdfBuilding = true; busy(true); $('shareBtn').disabled = true;
   try { blob = await getPdf(d); } catch (e) { toast('Could not build the PDF: ' + errText(e)); return; }
@@ -374,6 +378,7 @@ async function openEdit(p, d) {
   d = d || curDoc; if (!d) return;
   const from = current(); edOpening = true; busy(true);
   try {
+    await rotChain; while (p.next) p = p.next;                     // a turn that was queued or just stored the page under a new id
     let rec = await pageGet(p.id, ['orig']); if (!rec) throw new Error('page data is missing');
     const hasOrig = !!rec.orig;
     if (!hasOrig) rec = await pageGet(p.id, ['jpeg']);
@@ -470,14 +475,16 @@ $('editNext').addEventListener('click', async () => {
   if (ed.step === 'crop' && LOOKS) { ed.step = 'filter'; ed.warped = null; renderEdit(); return; }
   const e0 = ed, d = e0.doc;
   if (!d || JSON.stringify([e0.quad, e0.filter, e0.rot]) === e0.start) { back(); return; }
+  if (!IMG.quadUsable(e0.quad)) { toast('The corners must not cross. Move them so the frame is a simple shape.'); return; }
   if (!hasContent(d)) { toast('This document was changed on another device. The crop was not applied; the new version is loading.'); back(); syncNow(); return; }      // the download waits for the corners to close
   edApplying = true; busy(true); $('editNext').disabled = true;
   try {
     const r = await task({ cmd: 'process', blob: e0.blob, quad: e0.quad, filter: e0.filter, rot: e0.rot, keepOrig: false, maxOrig: 2800, maxOut: 2400 });
     const meta = { w: r.w, h: r.h, thumb: r.thumb };
     if (e0.hasOrig) Object.assign(meta, { quad: e0.quad, filter: e0.filter, rot: e0.rot, origW: e0.origW, origH: e0.origH });
-    const wasLast = camDoc === d && d.pages[d.pages.length - 1] === e0.page;
-    if (!(await replacePage(d, e0.page, r, e0.hasOrig ? e0.blob : null, meta))) throw new Error('the document changed meanwhile');
+    let pg = e0.page; while (pg.next) pg = pg.next;              // the page as it is listed now
+    const wasLast = camDoc === d && d.pages[d.pages.length - 1] === pg;
+    if (!(await replacePage(d, pg, r, e0.hasOrig ? e0.blob : null, meta))) throw new Error('the document changed meanwhile');
     if (wasLast) $('doneThumb').src = r.thumb;      // the camera's Done button shows this page
     if (ed === e0) back(); else if (curDoc === d && current() === 'doc') renderDoc();      // left the editor meanwhile: stay where the user is
   } catch (e) { toast('Could not apply: ' + errText(e)); } finally { edApplying = false; busy(false); $('editNext').disabled = false; }

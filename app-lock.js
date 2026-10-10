@@ -7,7 +7,7 @@ const COVERED = ['home', 'doc', 'edit', 'cam', 'sheet'];
 // Only work that ends by itself counts: a screen that is merely open (the corners, the camera) is
 // restored after the restart instead (see restartLocked). busyN covers the queue, a rotation, the
 // corners being opened or applied and a PDF build.
-const workInFlight = () => shotsPending > 0 || selBusy || driveBusy || qLen > 0 || syncing || Date.now() < holdReloadUntil || pickerOpen || edApplying || pdfBuilding || busyN > 0;
+const workInFlight = () => shotsPending > 0 || selBusy || driveBusy || qLen > 0 || syncing || persistQueued || Date.now() < holdReloadUntil || pickerOpen || edApplying || pdfBuilding || busyN > 0;
 
 // ---------- lock screen ----------
 // soft = shown over a running app because work is still in flight; the page restarts (and the key
@@ -56,11 +56,12 @@ $('unlockBtn').addEventListener('click', tryUnlock);
 $('pinInput').addEventListener('keydown', e => { if (e.key === 'Enter') tryUnlock(); });
 $('lockReset').addEventListener('click', () => popup('Reset Snapdoc on this device?',
   'Everything stored here is erased: scans, lock and sign-in. Scans that were synced come back after you sign in and enter your encryption password again. Scans that were never synced are lost.',
-  [{ label: 'Erase and reset', cls: 'danger', fn: () => wipeEverything().then(() => location.reload()) }, { label: 'Cancel', cls: 'quiet' }], { lockOk: true }));
+  [{ label: 'Erase and reset', cls: 'danger', fn: () => wipeEverything().then(() => location.reload(), e => popup('Reset', errText(e), [{ label: 'OK', cls: 'primary' }], { lockOk: true })) }, { label: 'Cancel', cls: 'quiet' }], { lockOk: true }));
 // The erase itself happens at the very start of the fresh page (boot), where nothing else can write
 // a record under the old key beside it.
-async function wipeEverything() { try { sessionStorage.setItem(WIPE_KEY, '1'); } catch (e) {} }
+async function wipeEverything() { try { sessionStorage.setItem(WIPE_KEY, '1'); } catch (e) { throw new Error('This browser blocks session storage. Clear the site data in the browser settings instead.'); } }
 async function wipeNow() {
+  try { await Vault.wipeBox(); } catch (e) {}
   await idb.wipe();
   try { for (const k of Object.keys(localStorage)) if (k.startsWith('snapdoc.')) localStorage.removeItem(k); sessionStorage.removeItem(RESUME_KEY); sessionStorage.removeItem(EDIT_KEY); } catch (e) {}
 }
@@ -68,8 +69,8 @@ async function wipeNow() {
 // restarts when that work is done. A restart also clears the key and every decrypted image from memory.
 function relock() {
   if (!Vault.lockType() || locked || passive) return;
-  if (workInFlight()) { showLock(true); return; }
-  restartLocked();
+  showLock(true);                                                  // the cover first, whatever follows; then the restart, now or once the work is done
+  if (!workInFlight()) restartLocked(true);
 }
 // soft: the lock screen is up and the user may unlock meanwhile; then the key stays and nothing restarts.
 // The restart waits for the work that ends by itself, stores the list (and stays on the lock screen,
@@ -80,28 +81,37 @@ async function restartLocked(soft) {
   if (restarting) return; restarting = true;
   try {
     while (shotsPending > 0 || qLen > 0) { await waitForPages(); if (shotsPending > 0) await new Promise(r => setTimeout(r, 100)); }
-    if (soft && (!locked || unlocking || $('pinInput').value)) { restarting = false; return; }
-    const resume = curDoc || (camDoc && camDoc.pages.length ? camDoc : null);
-    try { sessionStorage.setItem(RESUME_KEY, resume ? resume.id : ''); } catch (e) {}
-    if (ed) try { sessionStorage.setItem(EDIT_KEY, JSON.stringify({ doc: ed.doc.id, page: ed.page.id, quad: ed.quad, filter: ed.filter, rot: ed.rot })); } catch (e) {}
+    const typing = () => soft && (!locked || unlocking || $('pinInput').value);
+    if (typing()) { restarting = false; return; }
+    const resume = curDoc || (camDoc && camDoc.pages.length ? camDoc : null), editState = ed ? { doc: ed.doc.id, page: ed.page.id, quad: ed.quad, filter: ed.filter, rot: ed.rot } : null;
     if (current() === 'doc') commitName();
     if (stack.includes('cam')) { try { stopCamera(); } catch (e) {} }
     await waitForPages();
-    if (!(await persist())) {                                     // the list could not be stored: no restart on an unsaved state
-      if (locked) $('lockErr').textContent = 'Your last changes could not be saved. Trying again…';
+    if (docsLoaded && !(await persist())) {                       // the list could not be stored: no restart on an unsaved state
+      if (!locked && Vault.lockType()) showLock(true);            // and no open app meanwhile
+      $('lockErr').textContent = 'Your last changes could not be saved. Trying again…';
       restarting = false; setTimeout(() => restartLocked(soft), 5000); return;
     }
-    if (soft && (!locked || unlocking)) { restarting = false; return; }
+    if (typing()) { restarting = false; return; }
+    try { sessionStorage.setItem(RESUME_KEY, resume ? resume.id : ''); if (editState) sessionStorage.setItem(EDIT_KEY, JSON.stringify(editState)); } catch (e) {}      // written only right before the restart
+    await swSwitch();                                              // a release that waits is switched in now: the restart lands in it
     reloadPage();
   } catch (e) { restarting = false; }
 }
 // a sign-in link that is waiting goes back onto the address, so that the fresh start reads it
-function reloadPage() { if (linkHash) { try { history.replaceState(history.state, '', location.pathname + location.search + linkHash); } catch (e) {} } location.reload(); }
+function reloadPage() {
+  let h = linkHash; if (!h) { try { h = sessionStorage.getItem(LINKHASH_KEY) || ''; } catch (e) {} }
+  try { sessionStorage.removeItem(LINKHASH_KEY); } catch (e) {}
+  if (h) { try { history.replaceState(history.state, '', location.pathname + location.search + h); } catch (e) {} }
+  location.reload();
+}
 // A sign-in link (or Google's answer) opened in the running app: taken off the address at once and
 // handled by a fresh start as soon as nothing is in flight, through the same careful path as a lock.
 function linkOpened() {
   linkHash = location.hash; try { history.replaceState(histState(), '', location.pathname + location.search); } catch (e) {}
+  try { sessionStorage.setItem(LINKHASH_KEY, linkHash); } catch (e) {}      // survives a window that steps aside: "Use Snapdoc here" takes it along
   if (passive) return;
+  if (locked && !docsLoaded) { reloadPage(); return; }            // the lock screen of a fresh start: nothing can be unsaved yet
   const go = () => { if (restarting) return; if (workInFlight()) { setTimeout(go, 1000); return; } restartLocked(false); };
   go();
 }
@@ -190,7 +200,7 @@ function renderLockBox() {
       const prob = pinProblem(a); if (prob) { hint.textContent = prob; return; }
       if (a !== b) { hint.textContent = 'The two entries differ.'; return; }
       saving = true; hint.textContent = 'Setting up…';
-      try { await Vault.setPin(a); pinStep = false; toast('Lock is on'); renderLockBox(); resealAll(); } catch (e) { hint.textContent = 'Not set up: ' + errText(e); } finally { saving = false; }
+      try { await Vault.setPin(a); pinStep = false; toast('Lock is on'); renderLockBox(); resealAll(); } catch (e) { hint.textContent = 'Not set up: ' + errText(e); if (Vault.lockType()) { pinStep = false; renderLockBox(); resealAll(); } } finally { saving = false; }
     });
     return;
   }
@@ -206,7 +216,7 @@ function renderLockBox() {
       hint.textContent = 'Confirm with your fingerprint or screen lock. Your phone may ask twice.';
       const t = await Vault.setBiometric();
       toast(t === 'gate' ? 'Lock is on. On this browser it guards the screen only.' : 'Lock is on'); renderLockBox(); resealAll();
-    } catch (e) { hint.textContent = e && e.name === 'NotAllowedError' ? 'Not set up: it was cancelled. Tap again to retry.' : 'Not set up: ' + errText(e); }
+    } catch (e) { hint.textContent = e && e.name === 'NotAllowedError' ? 'Not set up: it was cancelled. Tap again to retry.' : 'Not set up: ' + errText(e); if (Vault.lockType()) { renderLockBox(); resealAll(); } }
     finally { setting = false; }
   });
 }

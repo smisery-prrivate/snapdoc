@@ -1,8 +1,9 @@
 'use strict';
+if (self !== top) { try { document.documentElement.hidden = true; } catch (e) {} throw new Error('Snapdoc does not run inside another page.'); }      // never framed by another site
 /* Snapdoc core: helpers, settings, encrypted storage, the document model, the processing
    queue, screens and the back button. The app is several plain script files that share one
    scope (no build step); index.html loads them in order. */
-const VERSION = 'v12';
+const VERSION = 'v13';
 const $ = id => document.getElementById(id);
 const IMG = self.SnapdocImaging;
 const CFG = self.APP_CONFIG || {};
@@ -25,7 +26,10 @@ const safeThumb = t => typeof t === 'string' && /^data:image\/(jpeg|png|webp);ba
 // frozen in the background and wakes up late) cannot write stale data over newer data.
 const INSTANCE_ID = uid(), BOOT_ID = INSTANCE_ID.slice(0, 8);
 let passive = false;
-const isOwner = () => { try { const o = localStorage.getItem(OWNER_KEY); return !o || o === INSTANCE_ID; } catch (e) { return true; } };
+// markNeeded: another window has shown itself (or the mark could not be written): from then on a
+// mark that cannot be read counts as "not the owner", never as a free pass
+let markNeeded = false;
+const isOwner = () => { try { const o = localStorage.getItem(OWNER_KEY); return !o || o === INSTANCE_ID; } catch (e) { return !markNeeded; } };
 function writeGuard() {
   if (!passive && isOwner()) return;
   if (!passive && typeof instanceLost === 'function') instanceLost();
@@ -40,7 +44,9 @@ function writeGuard() {
 const LOOKS = false;
 const lookOf = f => LOOKS ? (f || 'color') : 'photo';
 let settings = { filter: 'photo', pageSize: 'A4', lockAfter: 60, batch: false, auto: true };
+const LOCK_AFTER = [5, 60, 300, 1800];
 try { Object.assign(settings, JSON.parse(localStorage.getItem(SET_KEY) || '{}')); } catch (e) {}
+if (!LOCK_AFTER.includes(+settings.lockAfter)) settings.lockAfter = 60;      // only the offered values: nothing in plain storage can switch the lock off
 if (!LOOKS) settings.filter = 'photo';              // also for an install that had a look stored from an earlier version
 const saveSettings = () => { try { localStorage.setItem(SET_KEY, JSON.stringify(settings)); } catch (e) {} };
 
@@ -54,7 +60,14 @@ const idb = (() => {
     const r = indexedDB.open('snapdoc', 2);
     r.onupgradeneeded = () => { const d = r.result; for (const s of STORES) if (!d.objectStoreNames.contains(s)) d.createObjectStore(s, { keyPath: 'id' }); };
     r.onblocked = () => { try { fatal('An older Snapdoc window is still open. Close it, then open Snapdoc again.'); } catch (e) {} };
-    r.onsuccess = () => { const db = r.result; db.onversionchange = () => { try { db.close(); } catch (e) {} dbp = null; try { instanceLost(); } catch (e) {} }; res(db); };
+    r.onsuccess = () => {
+      const db = r.result;
+      db.onversionchange = async () => {                            // a newer release wants the database: the shots in flight are finished first, then this window steps aside
+        try { while (qLen > 0 || shotsPending > 0) await new Promise(f => setTimeout(f, 100)); } catch (e) {}
+        try { db.close(); } catch (e) {} dbp = null; try { instanceLost(); } catch (e) {}
+      };
+      res(db);
+    };
     r.onerror = () => rej(r.error);
   }));
   const txOpts = (store, mode) => mode === 'readwrite' && store === 'meta' ? { durability: 'strict' } : undefined;      // the key record and the list are on disk before the next step relies on them
@@ -91,24 +104,25 @@ let recWrites = 0, recSeq = 0;
 // fields: jpeg / prev / orig (Blob or null) and meta (small object, merged into what is there).
 // Only the fields given are replaced, inside one transaction on the record as it is stored then;
 // the meta object is written only if the stored one is still the one that was read and merged.
+// The write time lives inside the sealed meta object (t); nothing readable is written beside it.
 async function pagePut(id, docId, fields) {
   recWrites++; recSeq++;
   try {
     for (;;) {
       const gen = Vault.keyGen(), upd = {};
       for (const k of ['jpeg', 'prev', 'orig']) if (k in fields) upd[k] = fields[k] ? await Vault.sealBlob(fields[k], pLabel(id, k)) : null;
-      if (fields.meta) {
-        for (;;) {
-          const r = await idb.get('pages', id), was = (r && r.m) || null;
-          const cur = was ? await Vault.openJson(was, pLabel(id, 'm')) : {};
-          const m = await Vault.sealJson(Object.assign(cur, fields.meta), pLabel(id, 'm'));
-          if (await idb.cas('pages', id, c => { const rec = c || { id, doc: docId }; if (was ? !sameIv(rec.m, was) : !!rec.m) return; return Object.assign(rec, upd, { m, ts: Date.now() }); })) break;
-        }
-      } else await idb.cas('pages', id, c => Object.assign(c || { id, doc: docId }, upd, { ts: Date.now() }));
+      for (;;) {
+        const r = await idb.get('pages', id), was = (r && r.m) || null;
+        let cur = {}; if (was) { try { cur = await Vault.openJson(was, pLabel(id, 'm')); } catch (e) { cur = {}; } }
+        const m = await Vault.sealJson(Object.assign(cur, fields.meta || {}, { t: Date.now() }), pLabel(id, 'm'));
+        if (await idb.cas('pages', id, c => { const rec = c || { id }; if (was ? !sameIv(rec.m, was) : !!rec.m) return; delete rec.doc; delete rec.ts; return Object.assign(rec, upd, { m }); })) break;
+      }
       if (Vault.keyGen() === gen) return;
     }
   } finally { recWrites--; recSeq++; }
 }
+// the write time of a page record (for the sweep), from inside the sealed meta; records from before v13 carried it beside
+async function pageTime(r) { if (!r) return 0; try { const m = r.m ? await Vault.openJson(r.m, pLabel(r.id, 'm')) : {}; return m.t || r.ts || 0; } catch (e) { return r.ts || 0; } }
 // want: which blobs to decrypt, e.g. ['prev']; the small meta object always comes along
 async function pageGet(id, want) {
   const rec = await idb.get('pages', id); if (!rec) return null;
@@ -185,17 +199,20 @@ async function resealAll() {
               return ch ? cur : undefined;
             });
             mark.last[store] = id; if (++n % 20 === 0) await idb.put('meta', mark).catch(() => {});
-          } catch (e) { failed++; if (e && e.name === 'QuotaExceededError') break outer; }
+          } catch (e) { failed++; break outer; }                    // the mark stays before this record: the next run tries it again, the old keys wait
         }
       }
       try { await idb.put('meta', mark); } catch (e) {}
       if (failed) break;
       if (!(await persist())) break;                                // the list under the current key, or no drop
-      const sr = await idb.get('meta', 'session');                  // the stored sign-in entry itself, not the one in memory
-      if (sr && sr.data) { const nb = await Vault.reseal(sr.data, 'sd|session'); if (nb) await idb.cas('meta', 'session', c => c && sameIv(c.data, sr.data) ? { id: 'session', data: nb } : undefined); }
-      if (!(await Vault.resealCloudKey())) break;
+      const SMALL = [['session', 'sd|session'], ['drive', 'sd|drive']];      // the stored entries themselves, not the ones in memory
+      for (const [id, aad] of SMALL) {
+        const sr = await idb.get('meta', id);
+        if (sr && sr.data) { const nb = await Vault.reseal(sr.data, aad); if (nb) await idb.cas('meta', id, c => c && sameIv(c.data, sr.data) ? { id, data: nb } : undefined); }
+      }
+      if (!(await Vault.resealCloudKey(session ? session.uid : ''))) break;
       let under = true;                                             // read back: nothing in meta may still be under a previous key
-      for (const [id, aad] of [['docs', 'sd|docs'], ['session', 'sd|session']]) { const r = await idb.get('meta', id); if (r && r.data && (await Vault.reseal(r.data, aad)) !== null) under = false; }
+      for (const [id, aad] of [['docs', 'sd|docs']].concat(SMALL)) { const r = await idb.get('meta', id); if (r && r.data && (await Vault.reseal(r.data, aad)) !== null) under = false; }
       if (!under) break;
       while (recWrites > 0) await new Promise(r => setTimeout(r, 50));
       if (passive || locked || !Vault.isOpen()) return;
@@ -211,7 +228,7 @@ async function resealAll() {
 }
 
 // ---------- documents: one encrypted list; page images live in their own records ----------
-let docs = [], snap = {}, foreignDirty = false, docsLoaded = false, cursors = {};      // cursors: sync bookmark per cloud account, stored with the list
+let docs = [], snap = {}, foreignDirty = false, docsLoaded = false, cursors = {}, account = '';      // cursors: sync bookmark per cloud account; account: the cloud account this list last synced with; both stored with the list
 let curDoc = null, camDoc = null;
 const sigOf = d => JSON.stringify([d.name, !!d.deleted, d.rev || 0]);
 function migrate(d) {
@@ -225,18 +242,19 @@ function migrate(d) {
 const isBusy = d => d === curDoc || d === camDoc || (qLen > 0 && d.pages.some(p => p.status));
 // this device holds the newest pages of the document (false while a newer version is still downloading)
 const hasContent = d => d.rev_have >= d.rev;
-const unpackList = v => Array.isArray(v) ? { docs: v, cursors: {} } : (v && Array.isArray(v.docs) ? { docs: v.docs, cursors: v.cursors || {} } : { docs: [], cursors: {} });
+const unpackList = v => Array.isArray(v) ? { docs: v, cursors: {}, account: '' } : (v && Array.isArray(v.docs) ? { docs: v.docs, cursors: v.cursors || {}, account: v.account || '' } : { docs: [], cursors: {}, account: '' });
 async function loadDocs() {
   const r = await idb.get('meta', 'docs'); let v = null;
   if (r) v = await Vault.openJson(r.data, 'sd|docs');
   const u = unpackList(v);
-  docs = u.docs.map(migrate); cursors = u.cursors; snap = {};
+  docs = u.docs.map(migrate); cursors = u.cursors; account = u.account; snap = {};
   for (const d of docs) snap[d.id] = sigOf(d);
   docsLoaded = true;
 }
 async function mergeStored() {           // another tab wrote meanwhile: adopt what is newer there
   let stored; try { const r = await idb.get('meta', 'docs'); if (!r) return; stored = unpackList(await Vault.openJson(r.data, 'sd|docs')); } catch (e) { return; }
   for (const k in stored.cursors) cursors[k] = Math.max(cursors[k] || 0, stored.cursors[k] || 0);
+  if (stored.account && !account) account = stored.account;
   for (const s of stored.docs) {
     migrate(s); const d = docs.find(x => x.id === s.id);
     if (!d || !isBusy(d)) s.pages = s.pages.filter(p => !p.status);              // never take over someone else's unfinished captures
@@ -255,7 +273,7 @@ function persist() {
     persistQueued = false;
     if (passive) return false;
     if (foreignDirty) { foreignDirty = false; await mergeStored(); }
-    await idb.put('meta', { id: 'docs', data: await Vault.sealJson({ docs, cursors }, 'sd|docs') });
+    await idb.put('meta', { id: 'docs', data: await Vault.sealJson({ docs, cursors, account }, 'sd|docs') });
     persistFailed = false;
     try { localStorage.setItem(TICK_KEY, Date.now() + '.' + Math.random()); } catch (e) {}
     return true;
@@ -264,7 +282,7 @@ function persist() {
 }
 // a delete marker older than 60 days goes only when nothing is owed to the cloud any more: the
 // marker sent in its current form and the file removal confirmed, or the document never reached a cloud
-const settledTombstone = d => (d.cloudPurged && d.srv === d.updated_at) || (!d.srv && !d.pushed_rev && !d.row_rev);
+const settledTombstone = d => !(d.owed && d.owed.length) && ((d.cloudPurged && d.srv === d.updated_at) || (!d.srv && !d.pushed_rev && !d.row_rev));
 function save(opts) {
   const now = Date.now();
   for (const d of docs) { const s = sigOf(d); if (snap[d.id] !== s) { d.updated_at = Math.max(now, d.updated_at + 1); snap[d.id] = s; } }
@@ -309,18 +327,25 @@ async function purgeDocData(d, pages) {
 }
 
 // ---------- worker: processing off the main thread, inline fallback ----------
-let worker = null, seq = 0; const pending = new Map();
+let worker = null, seq = 0; const pending = new Map();      // pending: id -> { res, rej, msg } (msg kept for a retry on a fresh worker)
 function startWorker() {
   if (!self.Worker || !self.OffscreenCanvas) return;
   try {
     worker = new Worker('worker.js');
     worker.onmessage = e => { const p = pending.get(e.data.id); if (!p) return; pending.delete(e.data.id); e.data.ok ? p.res(e.data) : p.rej(new Error(e.data.error)); };
-    worker.onerror = () => { for (const p of pending.values()) p.rej(new Error('worker failed')); pending.clear(); worker = null; };
+    worker.onerror = () => {                                      // the worker died: a fresh one takes over; what was in flight is sent again once (a message whose picture was handed over cannot be)
+      const w = worker; worker = null; try { w.terminate(); } catch (e) {}
+      const again = [...pending.values()]; pending.clear();
+      startWorker();
+      for (const p of again) { if (worker && !p.msg.bitmap && !p.retried) { p.retried = true; p.msg.id = ++seq; pending.set(p.msg.id, p); worker.postMessage(p.msg); } else p.rej(new Error('worker failed')); }
+    };
   } catch (e) { worker = null; }
 }
+const ALIVE_KEY = 'snapdoc.alive';
+const markAlive = () => { try { localStorage.setItem(ALIVE_KEY, String(Date.now())); } catch (e) {} };      // "this window is alive", readable by another window even while this one cannot answer
 function task(msg) {
-  if (!worker) return IMG.tasks[msg.cmd](msg);
-  return new Promise((res, rej) => { const id = ++seq; pending.set(id, { res, rej }); worker.postMessage(Object.assign({ id }, msg)); });
+  if (!worker) { markAlive(); return IMG.tasks[msg.cmd](msg); }     // on the main thread: the stamp says so before the thread is busy
+  return new Promise((res, rej) => { const id = ++seq, m = Object.assign({ id }, msg); pending.set(id, { res, rej, msg: m }); worker.postMessage(m); });
 }
 let q = Promise.resolve(), qLen = 0, busyN = 0;
 function queue(fn) { qLen++; busy(true); q = q.then(fn).catch(e => toast('Processing failed: ' + errText(e))).then(() => { qLen--; busy(false); }); return q; }
@@ -342,10 +367,14 @@ function current() { return stack.slice().reverse().find(s => BASE.includes(s)) 
 const histState = () => ({ n: stack.length, b: BOOT_ID });
 function push(name) { stack.push(name); history.pushState(histState(), ''); applyStack(); }
 function replaceTop(name) { leave(stack.pop()); stack.push(name); history.replaceState(histState(), ''); applyStack(); }
-// navPending: a step back has been asked for and its popstate has not arrived yet
-let navPending = 0;
+// navPending: a step back has been asked for and its popstate has not arrived yet; navQueue: what
+// runs once it has (a close that would otherwise go one step too far)
+let navPending = 0; const navQueue = [];
+const afterPop = fn => { if (navPending) navQueue.push(fn); else fn(); };
+// close the document screen of d, whatever lies on top of it, exactly once
+function closeDocView(d) { afterPop(() => { if (curDoc === d && stack.includes('doc') && !navPending) { navPending++; history.go(-(stack.length - stack.indexOf('doc'))); } }); }
 const lockTop = () => { const t = stack[stack.length - 1]; return t === 'popup' || t === 'sheet'; };      // under the lock screen only its own popup (and the menu) may close
-function back() { if (locked && !lockTop()) return; if (stack.length > 1) { navPending++; history.back(); } }
+function back() { if (navPending || (locked && !lockTop())) return; if (stack.length > 1) { navPending++; history.back(); } }
 function leave(name) {
   if (name === 'cam') {                 // the system back button out of a new batch scan still ends on the new document and its name
     const d = camDoc, n = camCount, fromDoc = camFromDoc;
@@ -367,8 +396,10 @@ window.addEventListener('popstate', e => {
     return;
   }
   const depth = st.n || 1;
+  if (depth > stack.length) { history.go(stack.length - depth); return; }      // the browser's Forward button: back to the entry that matches the screens
   while (stack.length > depth && stack.length > 1) leave(stack.pop());
   applyStack(); renderAll(); afterNav();
+  while (navQueue.length) navQueue.shift()();
 });
 function renderAll() { renderHome(); renderSyncLine(); if (current() === 'doc') renderDoc(); }
 
@@ -388,16 +419,20 @@ function popup(title, text, buttons, opts) {
   popupState = { after: null, lockOk }; push('popup');
 }
 $('popup').addEventListener('click', e => { if (e.target === $('popup')) back(); });
-let toastTimer = null, toastAction = null, heldToast = '';
+let toastTimer = null, toastAction = null, heldToast = ''; const toastQueue = [];
+// a message with a choice (Undo) is never cut short by a plain message: that one waits its turn
+function endToast(settle) { const t = $('toast'); clearTimeout(toastTimer); t.classList.remove('show'); const a = toastAction; toastAction = null; if (settle && a && a.expire) a.expire(); if (toastQueue.length) toast(toastQueue.shift()); }
 // a pending Undo (or similar) is settled now, before something else changes the document
-function settleToast() { const t = $('toast'); clearTimeout(toastTimer); t.classList.remove('show'); const a = toastAction; toastAction = null; if (a && a.expire) a.expire(); }
+function settleToast() { endToast(true); }
 function toast(msg, action) {
   if (locked) { if (action) { if (action.expire) action.expire(); return; } heldToast = msg; return; }      // nothing is drawn over the lock screen; a plain message waits for the unlock
-  const t = $('toast'); clearTimeout(toastTimer);
+  const t = $('toast');
+  if (!action && toastAction) { if (!toastQueue.includes(msg)) toastQueue.push(msg); return; }
+  clearTimeout(toastTimer);
   if (toastAction && toastAction.expire) toastAction.expire();
   toastAction = action || null;
   t.innerHTML = ''; t.appendChild(document.createTextNode(msg));
-  if (action) { const b = document.createElement('button'); b.textContent = action.label; b.addEventListener('click', () => { t.classList.remove('show'); clearTimeout(toastTimer); toastAction = null; action.fn(); }); t.appendChild(b); }
+  if (action) { const b = document.createElement('button'); b.textContent = action.label; b.addEventListener('click', () => { endToast(false); action.fn(); }); t.appendChild(b); }
   t.classList.add('show');
-  toastTimer = setTimeout(() => { t.classList.remove('show'); if (toastAction && toastAction.expire) toastAction.expire(); toastAction = null; }, action ? 6000 : 2800);
+  toastTimer = setTimeout(() => endToast(true), action ? 6000 : 2800);
 }

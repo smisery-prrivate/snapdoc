@@ -248,7 +248,7 @@ async function quickPreview(v, quad) {
 // dead: the photo or the page failed, done: its page is finished, fixing: "Adjust crop" was tapped }
 function shotQuickReady(shot, r) {
   if (!r || !r.jpeg || shot.dead || shot.done) return;           // the photo failed, or its page is finished already
-  shot.quick = { url: URL.createObjectURL(r.jpeg), w: r.w, h: r.h };
+  shot.quick = { url: URL.createObjectURL(r.jpeg), w: r.w, h: r.h, quad: r.quad || null, sw: r.sw || 0, sh: r.sh || 0 };
   if (current() === 'cam' && camGen === shot.gen && !locked) showPeek(shot.quick.url, shot.label, shot, false);
   attachQuick(shot);
 }
@@ -297,6 +297,7 @@ async function shoot() {
 // working on, or into a new one.
 function lateCapture(blob, d0, shot) {
   let d = d0 && docs.includes(d0) && !d0.deleted ? d0 : null;
+  if (!d && shot && shot.sess === camSess && camDoc && docs.includes(camDoc) && !camDoc.deleted) d = camDoc;      // the camera moved on to a new document meanwhile (the old one was deleted elsewhere): the shot goes there
   if (!d) d = newDoc();
   const pageId = uid();
   d.pages.push({ id: pageId, status: 'processing' }); save({ sync: false });
@@ -326,7 +327,7 @@ function finishCamera() {
 // the view of a document that is not in the list any more closes, whatever lies on top of it
 function dropEmptyDoc(d) {
   const i = docs.indexOf(d); if (i >= 0) docs.splice(i, 1); delete snap[d.id];
-  if (curDoc === d && stack.includes('doc') && !navPending) { navPending++; history.go(-(stack.length - stack.indexOf('doc'))); }
+  closeDocView(d);
 }
 // d0: the document the page was captured for. If a delete from another device moved the page into
 // a new document meanwhile, the page is finished there.
@@ -377,7 +378,10 @@ function showFinished(d, r, shot) {
   $('doneThumb').src = r.thumb; $('doneThumb').hidden = false;
   // the photo can show the page a little differently from the live picture, and then it may be cut
   // differently: in that case the stored page is shown, so the pop-up never confirms a crop that is not there
-  const same = shot.quick && Math.abs(Math.log((r.w / r.h) / (shot.quick.w / shot.quick.h))) < 0.04;
+  // the same crop: the outline of the stored page and the quick picture's outline lie on the same spot of their pictures (and the shapes agree)
+  const norm = (q, w, h) => q.map(p => [p[0] / w, p[1] / h]);
+  let same = shot.quick && Math.abs(Math.log((r.w / r.h) / (shot.quick.w / shot.quick.h))) < 0.04;
+  if (same && shot.quick.quad && r.quad && r.origW && shot.quick.sw) { const a = norm(shot.quick.quad, shot.quick.sw, shot.quick.sh), b = norm(r.quad, r.origW, r.origH); same = a.every((p, i) => Math.hypot(p[0] - b[i][0], p[1] - b[i][1]) < 0.06); }
   if (shot.shown && same) {
     if (peekShot === shot && !$('camPeek').hidden) { if (peekUrl) URL.revokeObjectURL(peekUrl); peekUrl = URL.createObjectURL(r.prev); $('camPeekImg').src = peekUrl; }
     return;
@@ -448,9 +452,11 @@ $('torchBtn').addEventListener('click', async () => {
 });
 $('gallery').addEventListener('click', pickPhotos);
 $('importInput').addEventListener('cancel', () => { pickerOpen = false; });
+window.addEventListener('focus', () => { if (pickerOpen) setTimeout(() => { pickerOpen = false; }, 1500); });      // a dialog that was dismissed without the cancel event (older browsers) gives the focus back
 $('importInput').addEventListener('change', e => {
-  const files = Array.from(e.target.files || []).filter(f => /^image\//.test(f.type) || /\.(jpe?g|png|webp)$/i.test(f.name));
+  const all = Array.from(e.target.files || []), files = all.filter(f => /^image\//.test(f.type) || /\.(jpe?g|png|webp)$/i.test(f.name));
   e.target.value = ''; pickerOpen = false;
+  if (all.length && !files.length) toast(all.length === 1 ? 'That file is not an image Snapdoc can read.' : 'None of those files is an image Snapdoc can read.');
   if (!files.length || current() !== 'cam' || passive) return;
   for (const f of files) addCapture(f, null, true);
   finishCamera();

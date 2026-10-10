@@ -138,18 +138,20 @@ const Vault = (() => {
     const withBox = async raw => ({ lock: Object.assign({}, lock, { box: await sealWith(k, raw, aad) }), device: null, dirty: false });
     if (rec.dirty || !hadFile) {
       await rotate(withBox);
-      if (hadFile) await boxRemove();
+      if (hadFile && !(await boxRemove())) { try { await commit(copyRec({ fileLeft: true })); } catch (e) {} }      // the old key file is remembered and removed later
       return;
     }
-    // clean install: store the lock first (both ways in still work), then remove the file for good
+    // clean install: store the lock first (both ways in still work), then remove the file for good.
+    // Once the lock is stored the set-up has succeeded: a refused clean-up write leaves both ways
+    // in, and the step after the next unlock finishes it.
     await commit(copyRec({ lock: Object.assign({}, lock, { box: await sealWith(k, LKraw, aad) }) }));
-    if (await boxRemove()) await commit(copyRec({ device: null }));
-    else await rotate(withBox);
+    try { if (await boxRemove()) await commit(copyRec({ device: null })); else await rotate(withBox); } catch (e) {}
   }
   // after a PIN / screen-lock unlock: finish a lock set-up that was interrupted, or renew a key
   // whose older copy may still linger in storage
   async function afterKeyUnlock(k, aad) {
     await loadOlds();
+    if (rec.fileLeft && !rec.device && await boxRemove()) await commit(copyRec({ fileLeft: false }));
     if (!rec.device && !rec.dirty) return;
     const gone = rec.device && rec.device.opfs ? await boxRemove() : false;
     if (rec.device && gone && !rec.dirty) { await commit(copyRec({ device: null })); return; }
@@ -222,8 +224,8 @@ const Vault = (() => {
       if (!rec.device) { const ds = await deviceSlot(); ch.device = ds.slot; if (!ds.clean) ch.dirty = true; }
       await commit(copyRec(ch));
       return 'gate';
-    } catch (e) {                                       // the passkey made a moment ago is not in use: a browser that can is asked to remove it
-      try { if (self.PublicKeyCredential && PublicKeyCredential.signalUnknownCredential) await PublicKeyCredential.signalUnknownCredential({ rpId: location.hostname, credentialId: b64url(cred.rawId) }); } catch (e2) {}
+    } catch (e) {                                       // the passkey made a moment ago is not in use: a browser that can is asked to remove it (never one a stored lock needs)
+      if (!(rec.lock && rec.lock.credId === L.credId)) { try { if (self.PublicKeyCredential && PublicKeyCredential.signalUnknownCredential) await PublicKeyCredential.signalUnknownCredential({ rpId: location.hostname, credentialId: b64url(cred.rawId) }); } catch (e2) {} }
       throw e;
     }
   }
@@ -280,21 +282,24 @@ const Vault = (() => {
   }
 
   // ---------- cloud key and its password envelope ----------
+  // the account id is not written beside the box: it is bound into the seal, so a box opens only for its account
   async function loadCloudKey(uid) {
     CK = CKraw = null; ckUid = null;
-    const r = await kv.get(CK_ID); if (!r || r.uid !== uid) return false;
-    CKraw = new Uint8Array(await openLocal(r.box, 'sd|ck|local|' + uid)); CK = await importAes(CKraw); ckUid = uid;
+    const r = await kv.get(CK_ID); if (!r) return false;
+    try { CKraw = new Uint8Array(await openLocal(r.box, 'sd|ck|local|' + uid)); } catch (e) { CKraw = null; return false; }
+    CK = await importAes(CKraw); ckUid = uid;
     return true;
   }
   async function keepCloudKey(raw, uid) {
     CKraw = new Uint8Array(raw); CK = await importAes(CKraw); ckUid = uid;
-    await kv.put({ id: CK_ID, uid, box: await sealWith(need(LK), CKraw, 'sd|ck|local|' + uid) });
+    await kv.put({ id: CK_ID, box: await sealWith(need(LK), CKraw, 'sd|ck|local|' + uid) });
   }
-  // true once the stored cloud key is under the current local key (read back, not assumed)
-  async function resealCloudKey() {
+  // true once the stored cloud key is under the current local key (read back, not assumed); uid: the signed-in account
+  async function resealCloudKey(uid) {
     const r = await kv.get(CK_ID); if (!r) return true;
-    const nb = await reseal(r.box, 'sd|ck|local|' + r.uid); if (nb) await kv.put({ id: CK_ID, uid: r.uid, box: nb });
-    const back = await kv.get(CK_ID); return !back || (await reseal(back.box, 'sd|ck|local|' + back.uid)) === null;
+    const u = uid || (r.uid || '') || ckUid; if (!u) return false;      // r.uid: records from before v13 carried the account id
+    const nb = await reseal(r.box, 'sd|ck|local|' + u); if (nb) await kv.put({ id: CK_ID, box: nb });
+    const back = await kv.get(CK_ID); return !back || (await reseal(back.box, 'sd|ck|local|' + u)) === null;
   }
   async function wrapEnvelope(raw, password, uid) {
     const salt = rand(16), k = await pbkdfKey(password, salt, PBKDF_ITER);
@@ -324,7 +329,7 @@ const Vault = (() => {
   return {
     load, unlock, setBiometric, setPin, clearLock, biometricAvailable, suggestPassword,
     isOpen: () => !!LK, lockType: () => rec && rec.lock ? rec.lock.type : null, pinIsNumeric: () => !!(rec && rec.lock && rec.lock.numeric),
-    hasOldKeys: () => olds.length > 0, reseal, resealCloudKey, dropOldKeys, keyGen: () => keyGen, renewalId: () => (rec && rec.gen) || '',
+    hasOldKeys: () => olds.length > 0, reseal, resealCloudKey, dropOldKeys, keyGen: () => keyGen, renewalId: () => (rec && rec.gen) || '', wipeBox: boxRemove,
     seal: (data, aad) => sealWith(need(LK), data, aad), open: openLocal,
     sealBlob: async (blob, aad) => { const data = await blob.arrayBuffer(); return sealWith(need(LK), data, aad); },      // the key is chosen after the wait, never before
     openBlob: async (buf, aad, type) => new Blob([await openLocal(buf, aad)], { type: type || 'application/octet-stream' }),

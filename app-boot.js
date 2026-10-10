@@ -4,7 +4,7 @@
 function fatal(msg) { $('list').innerHTML = '<div class="empty"><b>Snapdoc cannot start</b>' + esc(msg) + '</div>'; }
 
 // ---------- one active instance (see app-core.js for the write guard) ----------
-const INSTANCE_LOCK = 'snapdoc-instance', TAKE_KEY = 'snapdoc.take', STAY_KEY = 'snapdoc.stay', WIPE_KEY = 'snapdoc.wipe', EDIT_KEY = 'snapdoc.edit';
+const INSTANCE_LOCK = 'snapdoc-instance', TAKE_KEY = 'snapdoc.take', STAY_KEY = 'snapdoc.stay', WIPE_KEY = 'snapdoc.wipe', EDIT_KEY = 'snapdoc.edit', LINKHASH_KEY = 'snapdoc.linkHash';
 let instanceRelease = null;
 const bc = 'BroadcastChannel' in self ? new BroadcastChannel('snapdoc') : null;
 function holdInstance(opts) {                       // resolves true once this instance holds the lock
@@ -13,8 +13,8 @@ function holdInstance(opts) {                       // resolves true once this i
     navigator.locks.request(INSTANCE_LOCK, opts, lock => {
       if (!lock) { resolve(false); return; }
       held = true;
-      try { localStorage.setItem(OWNER_KEY, INSTANCE_ID); } catch (e) {}
-      resolve(true);
+      try { localStorage.setItem(OWNER_KEY, INSTANCE_ID); } catch (e) { markNeeded = true; }
+      startAlive(); resolve(true);
       return new Promise(rel => { instanceRelease = rel; });
     }).catch(() => { if (held) instanceLost(); else resolve(false); });      // taken over by another window, or never granted
   });
@@ -27,7 +27,11 @@ function askHolder() {                              // is the instance that hold
     bc.addEventListener('message', on); bc.postMessage({ t: 'who', from: INSTANCE_ID });
   });
 }
+const AWAY_TEXT = 'Only one can be active at a time, so that nothing gets overwritten.';
 const awayNote = t => { const p = $('away').querySelector('p'); if (p) p.textContent = t; };
+let aliveTimer = null;
+function startAlive() { clearInterval(aliveTimer); markAlive(); aliveTimer = setInterval(markAlive, 1000); }      // once a second while this window holds the instance
+const aliveAge = () => { try { return Date.now() - (+localStorage.getItem(ALIVE_KEY) || 0); } catch (e) { return Infinity; } };
 // Waits for the other window to let go. While it still has shots to finish it says "busy" once a
 // second and is given that time, however long; the screen says so. A window that says nothing for
 // four seconds is frozen or gone. Resolves true once the lock is held.
@@ -35,21 +39,31 @@ function waitForRelease() {
   const ctl = new AbortController(); let timer = setTimeout(() => ctl.abort(), 4000), shown = false;
   const onBusy = e => { if (e.data && e.data.t === 'busy') { clearTimeout(timer); timer = setTimeout(() => ctl.abort(), 4000); if (!shown) { shown = true; awayNote('The other window is finishing its scans. Snapdoc opens here as soon as they are stored.'); $('away').hidden = false; } } };
   if (bc) bc.addEventListener('message', onBusy);
-  return holdInstance({ signal: ctl.signal }).then(got => { clearTimeout(timer); if (bc) bc.removeEventListener('message', onBusy); if (shown) $('away').hidden = true; return got; });
+  return holdInstance({ signal: ctl.signal }).then(got => { clearTimeout(timer); if (bc) bc.removeEventListener('message', onBusy); if (shown) { $('away').hidden = true; awayNote(AWAY_TEXT); } return got; });
 }
+// the other window says "busy" while it finishes; without messages its alive stamp (once a second,
+// and before a long job on its main thread) still says it is there
+const waitBusy = ms => new Promise(r => { if (!bc) { r(); return; } let t = setTimeout(done, ms); const on = e => { if (e.data && e.data.t === 'busy') { clearTimeout(t); t = setTimeout(done, 4000); } }; function done() { bc.removeEventListener('message', on); r(); } bc.addEventListener('message', on); });
 async function acquireInstance(force) {
-  if (!navigator.locks) {                                                   // older browsers: the newest window takes over, once the other has finished its shots
-    if (bc) { bc.postMessage({ t: 'yield', from: INSTANCE_ID }); await new Promise(r => { let t = setTimeout(r, 1500); const on = e => { if (e.data && e.data.t === 'busy') { clearTimeout(t); t = setTimeout(r, 4000); } }; bc.addEventListener('message', on); }); }
-    try { localStorage.setItem(OWNER_KEY, INSTANCE_ID); } catch (e) {} return true;
+  if (!navigator.locks) {                                                   // older browsers: the same hand-shake over messages, then the mark alone decides
+    if (!force && (await askHolder()) === true) return false;
+    if (bc) { bc.postMessage({ t: 'yield', from: INSTANCE_ID }); await waitBusy(1500); }
+    const t0 = Date.now(); while (aliveAge() < 30000 && Date.now() - t0 < 120000) await waitBusy(2000);      // alive but silent: given time
+    try { localStorage.setItem(OWNER_KEY, INSTANCE_ID); } catch (e) { markNeeded = true; }
+    instanceRelease = () => {};                                             // the hand-shake stays answered from this side too
+    startAlive(); return true;
   }
   if (await holdInstance({ ifAvailable: true })) return true;
+  if (!bc && !force) return false;                                          // no way to ask: never taken over on its own, the user decides with "Use Snapdoc here"
   if (!force && (await askHolder()) === true) return false;                 // another window is in use right now: let the user choose
   if (bc) bc.postMessage({ t: 'yield', from: INSTANCE_ID });                // ask it to finish and let go
   if (await waitForRelease()) return true;
   const ans = await askHolder();                                            // before taking over: who holds it now?
   if (ans === true) return false;                                           // a window in front of the user took over meanwhile
   if (ans === false) { if (bc) bc.postMessage({ t: 'yield', from: INSTANCE_ID }); if (await waitForRelease()) return true; if ((await askHolder()) != null) return false; }
-  return holdInstance({ steal: true });                                     // nobody answers: frozen or gone
+  const t0 = Date.now();
+  while (aliveAge() < 30000 && Date.now() - t0 < 120000) { if (await waitForRelease()) return true; if ((await askHolder()) === true) return false; }      // silent but alive (a busy main thread): given time
+  return holdInstance({ steal: true });                                     // nobody answers and nothing stirs: frozen or gone
 }
 // A window with a lock that has stepped aside restarts without the key, so nothing decrypted stays in its memory.
 function stepAside() { if (!Vault.lockType()) return; try { sessionStorage.setItem(STAY_KEY, '1'); } catch (e) {} location.reload(); }
@@ -67,60 +81,81 @@ async function yieldInstance() {                    // another window takes over
   // Shots that already flashed are finished first, however long that takes; the other window is
   // told "busy" once a second meanwhile and waits. A page is never thrown away because a second
   // window was opened. Syncing gets three seconds; the next window can redo it.
-  const shotsLeft = () => qLen > 0 || shotsPending > 0 || persistQueued;
+  const shotsLeft = () => qLen > 0 || shotsPending > 0 || persistQueued || edApplying || busyN > 0 || pdfBuilding;      // a crop, a rotation or a PDF under way finishes too
   while (shotsLeft() || (syncing && Date.now() - t0 < 3000)) {
     if (bc && Date.now() - said > 900) { said = Date.now(); bc.postMessage({ t: 'busy', from: INSTANCE_ID }); }
     await new Promise(r => setTimeout(r, 100));
   }
   try { await persistChain; } catch (e) {}
-  passive = true; stopEverything();
+  passive = true; stopEverything(); clearInterval(aliveTimer);
   if (instanceRelease) { instanceRelease(); instanceRelease = null; }
   stepAside();
 }
 if (bc) bc.addEventListener('message', e => {
-  const m = e.data || {}; if (m.from === INSTANCE_ID || passive || !instanceRelease) return;
+  const m = e.data || {}; if (m.from === INSTANCE_ID) return;
+  if (m.t === 'who' || m.t === 'yield') markNeeded = true;        // another window exists: the owner mark matters from now on
+  if (passive || !instanceRelease) return;
   if (m.t === 'who') bc.postMessage({ t: 'here', visible: !document.hidden, from: INSTANCE_ID });
   if (m.t === 'yield') yieldInstance();
 });
-$('awayBtn').addEventListener('click', () => { try { sessionStorage.setItem(TAKE_KEY, '1'); } catch (e) {} location.reload(); });
+$('awayBtn').addEventListener('click', () => { try { sessionStorage.setItem(TAKE_KEY, '1'); } catch (e) {} reloadPage(); });      // a sign-in link that landed here comes along
 
 // ---------- updates ----------
 // The service worker holds one complete release. When a new one has taken over, the page restarts
 // at a quiet moment so that it never runs a mix of two versions.
-let swReg = null, updateReady = false, lastUpdateCheck = 0;
+// A new release installs and then waits. The page running the old release keeps its complete set
+// until it asks for the switch itself, right before it restarts (afterNav at a quiet moment, or the
+// restart of the lock), so it never loads a file of the new release. If the switch happens anyway
+// (another window asked for it), this page restarts at the next quiet moment and makes no worker meanwhile.
+let swReg = null, updateReady = false, swTookOver = false, lastUpdateCheck = 0, swSwitching = false;
+const hadController = 'serviceWorker' in navigator && !!navigator.serviceWorker.controller;
+if ('serviceWorker' in navigator) navigator.serviceWorker.addEventListener('controllerchange', () => {      // attached at once: a release that takes over during start-up is noticed too
+  if (swSwitching) return;
+  if (hadController) { swTookOver = true; updateReady = true; afterNav(); }
+});
+function noteWaiting(r) { if (r && r.waiting && navigator.serviceWorker.controller) { updateReady = true; afterNav(); } }
 function registerSW() {
   let allow = location.protocol === 'https:'; try { allow = allow || localStorage.getItem('snapdoc.sw') === '1'; } catch (e) {}
   if (!('serviceWorker' in navigator) || !allow) return;
-  const had = !!navigator.serviceWorker.controller; let changes = 0;
-  navigator.serviceWorker.addEventListener('controllerchange', () => { changes++; if (had || changes > 1) { updateReady = true; afterNav(); } });
-  navigator.serviceWorker.register('sw.js').then(r => { swReg = r; }).catch(() => {});
+  navigator.serviceWorker.register('sw.js').then(r => {
+    swReg = r; noteWaiting(r);
+    r.addEventListener('updatefound', () => { const w = r.installing; if (w) w.addEventListener('statechange', () => { if (w.state === 'installed') noteWaiting(r); }); });
+  }).catch(() => {});
 }
 function checkForUpdate() {
   if (!swReg || Date.now() - lastUpdateCheck < 3600000) return;
   lastUpdateCheck = Date.now(); swReg.update().catch(() => {});
 }
+// the switch to the waiting release, right before a restart; resolves once it is in control (or after a moment)
+function swSwitch() {
+  if (!swReg || !swReg.waiting) return Promise.resolve();
+  swSwitching = true;
+  return new Promise(res => { const t = setTimeout(res, 3000); navigator.serviceWorker.addEventListener('controllerchange', () => { clearTimeout(t); res(); }, { once: true }); try { swReg.waiting.postMessage({ t: 'skip' }); } catch (e) { clearTimeout(t); res(); } });
+}
 // called after navigation and after background work: apply a waiting update when nothing is going on
 function afterNav() {
   if (!updateReady || locked || passive || !Vault.isOpen()) return;
-  if (current() !== 'home' || stack.length > 1 || workInFlight() || Vault.lockType()) return;      // with a lock it arrives at the next unlock instead
-  location.reload();
+  if (current() !== 'home' || stack.length > 1 || workInFlight() || Vault.lockType() || persistQueued || persistFailed) return;      // with a lock it arrives with the restart of the lock instead
+  persistChain.then(async () => { if (persistFailed || workInFlight() || current() !== 'home') return; await swSwitch(); location.reload(); });
 }
 
 async function boot() {
   const vt = $('vtag'); if (vt) vt.textContent = VERSION;
   // a sign-in link returns with tokens (or an error) in the URL fragment; take them and clean the address at once
-  let tokens = null, linkMsg = '', driveQp = null;
-  const h = location.hash || '';
+  let tokens = null, linkMsg = '', driveQp = null, search = location.search;
+  let h = location.hash || ''; if (!h) { try { h = sessionStorage.getItem(LINKHASH_KEY) || ''; sessionStorage.removeItem(LINKHASH_KEY); } catch (e) {} }      // a link that landed in a window which then stepped aside
   try {
+    const qs = new URLSearchParams(location.search), code = qs.get('code');
+    if (code) { tokens = { code }; qs.delete('code'); const rest = qs.toString(); search = rest ? '?' + rest : ''; }      // the PKCE form of the sign-in link: a one-time code in the query
     const qp = new URLSearchParams(h.slice(1));
     if ((qp.get('state') || '').startsWith(DRIVE_STATE + '.')) driveQp = qp;                       // back from Google (Drive copies)
-    else if (qp.get('access_token') && qp.get('refresh_token')) tokens = { access_token: qp.get('access_token'), refresh_token: qp.get('refresh_token') };
+    else if (!tokens && qp.get('access_token') && qp.get('refresh_token')) tokens = { access_token: qp.get('access_token'), refresh_token: qp.get('refresh_token') };
     else if (qp.get('error') || qp.get('error_code')) {                                             // a few fixed sentences: never the sender's own text
       const code = qp.get('error_code') || qp.get('error');
       linkMsg = code === 'otp_expired' ? 'This sign-in link has expired or was already used. Request a new one in the menu.' : code === 'access_denied' ? 'The sign-in link was refused. Request a new one in the menu.' : 'The sign-in link could not be used. Request a new one in the menu.';
     }
   } catch (e) {}
-  history.replaceState(histState(), '', location.pathname + location.search);
+  history.replaceState(histState(), '', location.pathname + search);
   applyStack(); startWorker();
 
   // a link is only accepted when this browser asked for one within the hour: only then may it take the app away from another window
@@ -129,16 +164,20 @@ async function boot() {
   if (linkMsg && !linkFresh) linkMsg = '';                              // an error link nobody asked for is not shown
   if (tokens && !linkFresh) { tokens = null; linkMsg = 'This sign-in link was not requested from this browser, or it is older than an hour. Request a new one in the menu.'; }
   let force = false, stay = false, wipe = false;
-  try { force = sessionStorage.getItem(TAKE_KEY) === '1'; sessionStorage.removeItem(TAKE_KEY); stay = sessionStorage.getItem(STAY_KEY) === '1'; if (force) { sessionStorage.removeItem(STAY_KEY); stay = false; } wipe = sessionStorage.getItem(WIPE_KEY) === '1'; sessionStorage.removeItem(WIPE_KEY); } catch (e) {}
-  if (stay && !tokens) { passive = true; showAway(); return; }          // this window stepped aside with a lock set: it stays key-free until "Use Snapdoc here"
-  let mine = true; try { mine = await acquireInstance(force || wipe || !!tokens); } catch (e) { mine = true; }
+  try { wipe = sessionStorage.getItem(WIPE_KEY) === '1'; force = sessionStorage.getItem(TAKE_KEY) === '1' || wipe; sessionStorage.removeItem(TAKE_KEY); stay = sessionStorage.getItem(STAY_KEY) === '1'; if (force) { sessionStorage.removeItem(STAY_KEY); stay = false; } } catch (e) {}
+  if (stay && !tokens && !driveQp) { passive = true; showAway(); return; }          // this window stepped aside with a lock set: it stays key-free until "Use Snapdoc here"
+  let mine = true; try { mine = await acquireInstance(force || !!tokens || !!driveQp); } catch (e) { mine = true; }      // a reply this browser asked Google for counts like a sign-in link
   if (!mine) { passive = true; showAway(); return; }
-  if (wipe) { try { await wipeNow(); } catch (e) {} }                   // "Reset this app": erased here, before anything else can write
+  if (wipe) { try { await wipeNow(); } catch (e) {} try { sessionStorage.removeItem(WIPE_KEY); } catch (e) {} }      // "Reset this app": erased here, before anything else can write; the mark goes only once it ran
   try { if (!(await idb.get('meta', 'keys'))) await idb.wipe(); } catch (e) {}      // no key record: nothing stored can be read; leftovers go before a new key is made
 
   let state;
-  try { state = await Vault.load(metaStore); } catch (e) { fatal('The storage of this browser could not be opened (' + errText(e) + '). Private windows and blocked site data prevent it.'); return; }
-  if (state === 'locked') { showLock(false); await whenUnlocked(); }
+  try { state = await Vault.load(metaStore); } catch (e) {
+    fatal('The storage of this browser could not be opened (' + errText(e) + '). Private windows and blocked site data prevent it.');
+    popup('Snapdoc cannot start', errText(e) + ' You can erase everything stored here and start again.', [{ label: 'Erase and reset', cls: 'danger', fn: () => wipeEverything().then(() => location.reload(), () => {}) }, { label: 'Not now', cls: 'quiet' }]);
+    return;
+  }
+  if (state === 'locked') { showLock(false); await whenUnlocked(); if (!isOwner()) { instanceLost(); return; } }
   try { await loadDocs(); } catch (e) { fatal('The stored documents could not be read (' + errText(e) + ').'); return; }
   await loadSession(); syncFormatCheck(); await loadDrive();
   let driveMsgBoot = ''; if (driveQp) { try { driveMsgBoot = await driveAdopt(driveQp); } catch (e) { driveMsgBoot = 'Google Drive was not connected: ' + errText(e); } }
@@ -194,7 +233,7 @@ async function housekeeping() {
     for (const id of await idb.keys('pages')) {
       if (!idle()) return;
       if (ref.has(id) || pendingDel.has(id)) continue;
-      const r = await idb.get('pages', id), t = r ? (r.ts || 0) : 0;
+      const r = await idb.get('pages', id), t = await pageTime(r);
       if (r && (t < old || t > Date.now() + 60000) && idle() && !inUse(id)) await idb.del('pages', id);      // a stamp from a clock that was ahead counts as old
     }
     const live = new Set(docs.filter(d => !d.deleted).map(d => d.id));
@@ -203,7 +242,7 @@ async function housekeeping() {
 }
 // another tab of the app changed something (only on browsers without the one-instance lock)
 window.addEventListener('storage', e => {
-  if (e.key === OWNER_KEY && e.newValue && e.newValue !== INSTANCE_ID && !passive && Vault.isOpen() && !navigator.locks) { instanceLost(); return; }
+  if (e.key === OWNER_KEY && e.newValue && e.newValue !== INSTANCE_ID) { markNeeded = true; if (!passive && !navigator.locks) { instanceLost(); return; } }      // a locked window steps aside just the same
   if (e.key !== TICK_KEY || !Vault.isOpen() || locked || passive) return;
   foreignDirty = true;
   mergeStored().then(() => { foreignDirty = false; return syncing ? null : loadSession(); }).then(renderAll).catch(() => {});

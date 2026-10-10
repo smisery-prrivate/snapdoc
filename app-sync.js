@@ -7,13 +7,13 @@
    cloud key together with its revision, change time and delete flag), delete a document on a
    device by forging a delete marker, or hand out an older file for a newer entry (the file
    carries its revision inside the encryption). */
-const SYNCUID_KEY = 'snapdoc.syncUid', LINK_KEY = 'snapdoc.linkAsked', FMT_KEY = 'snapdoc.syncFmt', SYNC_FMT = '4', MAX_FILE = 52428800;
+const SYNCUID_KEY = 'snapdoc.syncUid', LINK_KEY = 'snapdoc.linkAsked', FMT_KEY = 'snapdoc.syncFmt', SYNC_FMT = '4', MAX_FILE = 52428800, OK_KEY = 'snapdoc.lastOk', PKCE_KEY = 'snapdoc.pkce';
 let session = null, syncTimer = null, syncing = false, syncAgain = false, syncState = '', syncMsg = '';
 let keyNeed = '', keyEnv = null, keyBusy = false;      // keyNeed: '' | 'create' | 'enter' | 'change'
 
 const jwtPayload = t => JSON.parse(atob(t.split('.')[1].replace(/-/g, '+').replace(/_/g, '/')));
 const cursorKey = () => 'snapdoc.cursor.' + (session ? session.uid : '');
-const okKey = () => 'snapdoc.lastOk.' + (session ? session.uid : '');
+const okKey = () => OK_KEY;                                     // one key for the device; the account id is not written beside it
 const docLabel = d => (d.name || '').trim() || 'a document';
 const newTag = () => uid().replace(/-/g, '').slice(0, 12);
 const tick = () => { try { localStorage.setItem(TICK_KEY, Date.now() + '.' + Math.random()); } catch (e) {} };
@@ -28,13 +28,37 @@ async function storeSession() {
   if (session) await idb.put('meta', { id: 'session', data: await Vault.sealJson(session, 'sd|session') }); else await idb.del('meta', 'session');
   tick();
 }
+// Documents that were waiting for a version from a cloud this device no longer talks to (another
+// account, or signed out) are resolved here: the pages this device holds become a version of their
+// own; a document with nothing here is dropped.
+function resolveLocal() {
+  const now = Date.now();
+  for (const d of docs) {
+    if (d.deleted || d.rev_have === d.rev) continue;
+    if (d.pages.some(p => !p.status)) { d.rev = Math.max(now, d.rev + 1); d.rtag = newTag(); d.rev_have = d.rev; for (const p of d.pages) delete p.local; d.pageCount = d.pages.filter(p => !p.status).length; }
+    else if (d.pages.length) d.rev_have = d.rev;                   // pages still being worked on: they finish into this document
+    else { d.deleted = true; d.updated_at = Math.max(now, d.updated_at + 1); }
+  }
+}
 // Tokens from a sign-in link. Accepted only when this browser asked for a link within the last
-// hour, nobody is signed in, and the cloud confirms the token. Returns '' or the reason it was refused.
+// hour, nobody is signed in, and the cloud confirms the token. t: { access_token, refresh_token }
+// or { code } (the PKCE form: the code is exchanged here with the verifier this browser kept).
+// Returns '' or the reason it was refused.
 async function adoptLink(t) {
   let asked = 0; try { asked = +localStorage.getItem(LINK_KEY) || 0; localStorage.removeItem(LINK_KEY); } catch (e) {}
   if (!SYNC) return 'Cloud sync is not switched on in this version.';
   if (session) return 'A sign-in link was opened, but this device is already signed in. Sign out first to use another account.';
   if (!asked || Date.now() - asked > 3600000) return 'This sign-in link was not requested from this browser, or it is older than an hour. Request a new one in the menu.';
+  if (t.code) {
+    let verifier = ''; try { verifier = localStorage.getItem(PKCE_KEY) || ''; localStorage.removeItem(PKCE_KEY); } catch (e) {}
+    if (!verifier) return 'This sign-in link was not requested from this browser. Request a new one in the menu.';
+    try {
+      const r = await fetch(SYNC.url + '/auth/v1/token?grant_type=pkce', { method: 'POST', credentials: 'omit', cache: 'no-store', headers: { apikey: SYNC.key, 'Content-Type': 'application/json' }, body: JSON.stringify({ auth_code: t.code, code_verifier: verifier }) });
+      if (!r.ok) return 'The sign-in link could not be confirmed. Request a new one in the menu.';
+      const j = await r.json(); if (!j.access_token || !j.refresh_token) return 'The sign-in link could not be confirmed. Request a new one in the menu.';
+      t = { access_token: j.access_token, refresh_token: j.refresh_token };
+    } catch (e) { return 'The sign-in link could not be confirmed (no connection). Request a new one in the menu.'; }
+  }
   let u, p;
   try {
     p = jwtPayload(t.access_token);
@@ -45,17 +69,23 @@ async function adoptLink(t) {
   if (!u || !u.id || u.id !== p.sub) return 'The sign-in link could not be confirmed. Request a new one in the menu.';
   session = { access_token: t.access_token, refresh_token: t.refresh_token, expires_at: p.exp, email: u.email || '', uid: u.id };
   await storeSession();
-  if (localStorage.getItem(SYNCUID_KEY) !== session.uid) {       // first sign-in, or another account: this cloud knows nothing from here yet
-    for (const d of docs) { d.srv = 0; d.pushed_rev = 0; d.pushed_tag = ''; d.up_rev = 0; d.up_tag = ''; d.row_rev = 0; d.seen = 0; d.cloudPurged = false; }
-    cursors[session.uid] = 0; localStorage.removeItem(cursorKey()); localStorage.setItem(SYNCUID_KEY, session.uid);
-    await Vault.dropCloudKey(); persist();
+  let known = account === session.uid;
+  if (!known && !account) { try { known = localStorage.getItem(SYNCUID_KEY) === session.uid; } catch (e) {} }      // lists stored before v13 kept the account id beside the list
+  if (!known) {                                                     // first sign-in, or another account: this cloud knows nothing from here yet
+    for (const d of docs) { d.srv = 0; d.pushed_rev = 0; d.pushed_tag = ''; d.up_rev = 0; d.up_tag = ''; d.row_rev = 0; d.seen = 0; d.cloudPurged = false; delete d.owed; }
+    resolveLocal();
+    cursors[session.uid] = 0; try { localStorage.removeItem(cursorKey()); localStorage.removeItem(OK_KEY); } catch (e) {}
+    await Vault.dropCloudKey();
   }
+  account = session.uid; try { localStorage.removeItem(SYNCUID_KEY); } catch (e) {}
+  persist();
   await Vault.loadCloudKey(session.uid).catch(() => {});
   return '';
 }
 async function signOut() {
   session = null; keyNeed = ''; keyEnv = null;
   await storeSession(); await Vault.dropCloudKey();
+  resolveLocal(); persist();                                       // nothing can arrive from the cloud any more: what is here is what there is
   setSyncState(''); renderAll();
 }
 async function ensureSession() {
@@ -75,8 +105,18 @@ async function ensureSession() {
     return true;
   } catch (e) { return false; }
 }
-const api = (method, path, opts) => fetch(SYNC.url + path, { method, credentials: 'omit', cache: 'no-store',
-  headers: Object.assign({ apikey: SYNC.key, Authorization: 'Bearer ' + session.access_token }, (opts && opts.headers) || {}), body: opts && opts.body });
+// One request to the cloud. While a sync pass runs it carries the pass's abort signal, so a pass
+// that is cut off really stops. A 401 from the data API (the device clock may be behind the token's
+// lifetime) refreshes the session once and repeats the request.
+async function api(method, path, opts) {
+  const r = await fetch(SYNC.url + path, { method, credentials: 'omit', cache: 'no-store', signal: syncing && syncCtl ? syncCtl.signal : undefined,
+    headers: Object.assign({ apikey: SYNC.key, Authorization: 'Bearer ' + session.access_token }, (opts && opts.headers) || {}), body: opts && opts.body });
+  if (r.status === 401 && session && !(opts && opts.retried) && !path.startsWith('/auth/')) {
+    session.expires_at = 0;
+    if (await ensureSession()) return api(method, path, Object.assign({}, opts, { retried: true }));
+  }
+  return r;
+}
 async function httpError(what, r) {
   let t = ''; try { t = await r.text(); } catch (e) {}
   if (/PGRST205|Bucket not found|schema cache|does not exist/i.test(t) || (r.status === 404 && /rest\/v1/.test(r.url || '')))
@@ -94,7 +134,7 @@ function syncFormatCheck() {
   for (const d of docs) {
     if (d.srv > 0) d.srv = -1;
     d.row_rev = 0; d.seen = 0;
-    if (!d.rtag) { d.rtag = 'v2'; if (d.pushed_rev === d.rev && !d.pushed_tag) d.pushed_tag = 'v2'; }
+    if (!d.rtag) { d.rtag = d.pushed_rev === d.rev ? 'v2' : newTag(); if (d.pushed_rev === d.rev && !d.pushed_tag) d.pushed_tag = 'v2'; }      // only a version the cloud agreed on shares the common tag
     if (!d.deleted && d.rev_have === d.rev && d.pages.length) { d.up_rev = 0; d.up_tag = ''; }
   }
   try { localStorage.setItem(FMT_KEY, SYNC_FMT); } catch (e) {}
@@ -166,6 +206,7 @@ function forkLocal(d) {
   const c = migrate({ id: uid(), name: name + ' (copy from this device)', created_at: d.created_at, updated_at: now, srv: 0, pages: mine, pageCount: mine.length,
     size: mine.reduce((a, p) => a + (p.size || 0), 0), rev: now, rtag: newTag(), rev_have: now, pushed_rev: 0, up_rev: 0, deleted: false });
   docs.push(c); snap[c.id] = sigOf(c);
+  if (ed && ed.doc === d && mine.includes(ed.page)) ed.doc = c;      // the corners being adjusted belong to the copy now
   d.pages = d.pages.filter(p => p.status || p.local);
   for (const p of mine) dropPrev(p.id);
   idb.del('pdfs', d.id).catch(() => {});
@@ -201,7 +242,7 @@ async function applyRow(row) {
         adoptCloud(d, rev, tag, m);
         if (!holdsIt) d.rev_have = -1;                            // the pages here are not that version: download
       } else if (rev < d.pushed_rev && !wasDeleted) {             // the cloud went back to older pages (a device that never saw ours brought it back)
-        if (d.rev_have === d.rev && d.pages.some(p => !p.status)) { d.pushed_rev = rev; d.pushed_tag = tag; d.up_rev = 0; d.up_tag = ''; }   // ours is newer: file and entry go up again
+        if (d.rev_have === d.rev && d.pages.some(p => !p.status)) { d.pushed_rev = rev; d.pushed_tag = tag; d.up_rev = 0; d.up_tag = ''; d.rtag = newTag(); }   // ours is newer: file (under a fresh name) and entry go up again
         else { adoptCloud(d, rev, tag, m); d.rev_have = -1; }
       }
     }
@@ -210,10 +251,16 @@ async function applyRow(row) {
     if (!del) { d.name = String(m.name || ''); d.created_at = +m.created_at || d.created_at; }
     d.deleted = del; d.updated_at = upd; d.srv = upd;
     if (del && !wasDeleted) await deletedElsewhere(d);
-  } else if (upd === d.updated_at) d.srv = upd;
-  else if (del && !d.deleted) {                                   // our later change keeps the document, but the other device removed the file
-    if (d.pages.some(p => !p.status)) {                           // the pages here are the only ones left: they are the newest version and go up again
-      if (d.rev_have !== d.rev) { d.rev = Math.max(Date.now(), d.rev + 1); d.rtag = newTag(); d.rev_have = d.rev; d.pageCount = d.pages.filter(p => !p.status).length; }
+  } else if (upd === d.updated_at) {                              // the same stamp: normally this device's own entry echoed back
+    if (!!m.del !== !!d.deleted) {                                 // two devices stamped alike: a delete beats a live change, on both of them
+      if (del) { d.deleted = true; d.srv = upd; await deletedElsewhere(d); } else { d.srv = -1; d.cloudPurged = false; }
+    } else if (!del && String(m.name || '') !== d.name) {          // two different names with one stamp: the larger revision, then the larger name, on both of them
+      if (rev > d.rev || (rev === d.rev && String(m.name || '') > d.name)) { d.name = String(m.name || ''); d.srv = upd; } else d.srv = -1;
+    } else d.srv = upd;
+  } else if (del && !d.deleted) {                                   // our later change keeps the document, but the other device removed the file
+    if (d.pages.some(p => !p.status)) {                           // the pages here are the only ones left: they are the newest version and go up again, under a fresh name
+      for (const p of d.pages) delete p.local;
+      d.rev = Math.max(Date.now(), d.rev + 1); d.rtag = newTag(); d.rev_have = d.rev; d.pageCount = d.pages.filter(p => !p.status).length;
       d.pushed_rev = 0; d.pushed_tag = ''; d.up_rev = 0; d.up_tag = ''; d.srv = -1;
     } else { d.deleted = true; d.updated_at = upd; d.srv = upd; await deletedElsewhere(d); }
   } else { d.srv = -1; if (d.deleted) d.cloudPurged = false; }    // the cloud holds an older entry than ours (a late write replaced it): send ours again
@@ -232,17 +279,30 @@ async function deletedElsewhere(d) {
     n = migrate({ id: uid(), name: '', created_at: now, updated_at: now, srv: 0, pages: keep.map(p => { const q = Object.assign({}, p); delete q.local; return q; }), rev: now, rtag: newTag(), rev_have: now, pushed_rev: 0, up_rev: 0, deleted: false });
     docs.unshift(n); snap[n.id] = sigOf(n); touchContent(n);
     if (camDoc === d) { camDoc = n; camFromDoc = false; camCount = keep.length; }
-  } else if (camDoc === d) camDoc = null;                         // the next shot starts a new document
-  const onIt = curDoc === d && stack.includes('doc'), onCam = camDoc === n && n && stack.includes('cam');
+  } else if (camDoc === d) { camDoc = null; camCount = 0; $('doneThumb').hidden = true; updateCamUI(); }      // the next shot starts a new document; the count starts again
+  if (ed && ed.doc === d) {                                       // the corners being adjusted: they follow the page into the new document, or close
+    const np = n && n.pages.find(p => p.id === ed.page.id);
+    if (np) { ed.doc = n; ed.page = np; } else if (current() === 'edit') { toast('This document was deleted on another device. The crop was not applied.'); back(); }
+  }
+  const onIt = curDoc === d && stack.includes('doc');
   if (onIt) {
     if (n) { curDoc = n; if (current() === 'doc') renderDoc(); }
-    else if (!navPending) { navPending++; history.go(-(stack.length - stack.indexOf('doc'))); }
+    else closeDocView(d);
   }
   if (onIt || wasCam) toast(n ? 'This document was deleted on another device. The pages scanned here are kept in a new document.' : wasCam && !onIt ? 'This document was deleted on another device. New pages go into a new document.' : 'This document was deleted on another device.');
   await purgeDocData(d, gone);
 }
 const sealedMeta = d => Vault.csealJson(d.deleted ? { del: true, u: d.updated_at }
-  : { name: d.name, pages: d.pages.filter(p => !p.status && !p.local).length || d.pageCount || 0, size: d.size || 0, created_at: d.created_at, rev: d.up_rev || 0, tag: d.up_tag || '', u: d.updated_at, del: false }, 'sd|meta|' + d.id);
+  : { name: d.name, pages: hasContent(d) ? (d.pages.filter(p => !p.status && !p.local).length || d.pageCount || 0) : (d.pageCount || 0), size: d.size || 0, created_at: d.created_at, rev: d.up_rev || 0, tag: d.up_tag || '', u: d.updated_at, del: false }, 'sd|meta|' + d.id);
+// An object this device no longer needs in the bucket: removed now, or remembered on the document
+// and removed on a later pass. Nothing is left behind for good.
+async function dropObj(u, d, name) {
+  let ok = false;
+  try { const r = await api('DELETE', '/storage/v1/object/sd/' + name); ok = r.ok || r.status === 404 || (r.status === 400 && /not.?found/i.test(await r.text().catch(() => ''))); } catch (e) {}
+  if (ok) { if (d.owed) { d.owed = d.owed.filter(n => n !== name); if (!d.owed.length) delete d.owed; } }
+  else { d.owed = d.owed || []; if (!d.owed.includes(name)) d.owed.push(name); }
+  return ok;
+}
 // does the cloud entry of this document have to be written?
 const entryDue = d => d.deleted ? ((d.srv !== 0 || d.pushed_rev > 0) && d.srv !== d.updated_at)
   : d.up_rev > 0 && (d.up_rev !== d.pushed_rev || (d.up_tag || '') !== (d.pushed_tag || '') || d.updated_at !== d.srv);
@@ -263,7 +323,9 @@ async function writeEntry(d, u) {
 async function pullOne(d, u) {                                    // the cloud's entry for one document, applied here
   const r = await api('GET', '/rest/v1/sd_documents?select=id,meta,rev,updated_at,deleted,synced_at&user_id=eq.' + u + '&id=eq.' + encodeURIComponent(d.id));
   if (!r.ok) throw await httpError('Loading the entry', r);
-  const rows = await r.json(); if (rows.length) await applyRow(rows[0]); else d.seen = 0;
+  const rows = await r.json(); if (!rows.length) { d.seen = 0; return; }
+  d.seen = +rows[0].synced_at || 0;                               // whatever the row is, the next write replaces exactly this one (an entry this device cannot read is its own document's, under its own account)
+  await applyRow(rows[0]);
 }
 async function syncNow() {
   if (!SYNC || !session || !Vault.isOpen() || locked || passive) return;
@@ -276,13 +338,15 @@ async function syncNow() {
     const u = session.uid, stop = () => !session || session.uid !== u || passive || locked || !isOwner() || ctl.signal.aborted;
     if (cursors[u] == null) { let old = 0; try { old = +localStorage.getItem(cursorKey()) || 0; localStorage.removeItem(cursorKey()); } catch (e) {} cursors[u] = old; }      // from a version that kept it outside the list
     const cursor = cursors[u] || 0, from = Math.max(0, cursor - 3000);
-    let maxSeen = cursor, unreadable = 0;
-    for (let off = 0; ; off += 500) {                             // pull what changed since the last visit (small overlap: entries are idempotent)
-      const r = await api('GET', '/rest/v1/sd_documents?select=id,meta,rev,updated_at,deleted,synced_at&synced_at=gt.' + from + '&order=synced_at.asc,id.asc&limit=500&offset=' + off);
+    let maxSeen = cursor, unreadable = 0, after = null;
+    for (;;) {                                                    // pull what changed since the last visit (small overlap: entries are idempotent); pages by stamp and id, never by offset, so a row rewritten meanwhile shifts nothing
+      const where = after ? '&or=(synced_at.gt.' + after.s + ',and(synced_at.eq.' + after.s + ',id.gt.' + encodeURIComponent(after.id) + '))' : '&synced_at=gt.' + from;
+      const r = await api('GET', '/rest/v1/sd_documents?select=id,meta,rev,updated_at,deleted,synced_at' + where + '&order=synced_at.asc,id.asc&limit=500');
       if (!r.ok) throw await httpError('Loading the list', r);
       const rows = await r.json();
       for (const row of rows) { maxSeen = Math.max(maxSeen, +row.synced_at || 0); try { await applyRow(row); } catch (e) { unreadable++; } }
       if (rows.length < 500) break;
+      const last = rows[rows.length - 1]; after = { s: +last.synced_at || 0, id: String(last.id) };
     }
     if (stop()) return;
     if (maxSeen > cursor) { cursors[u] = maxSeen; if (!(await persist())) { cursors[u] = cursor; throw new Error('The document list could not be saved.'); } }   // the bookmark moves only with the list
@@ -312,7 +376,10 @@ async function syncNow() {
         let ok = r.ok;
         if (!ok && (r.status === 409 || r.status === 400)) { const t = await r.text().catch(() => ''); ok = /exist|duplicate/i.test(t); }      // this version is up already (an earlier pass, or another window)
         if (!ok) throw await httpError('Uploading "' + docLabel(d) + '"', r);
-        if (d.rev === rev && d.rtag === tag) { d.up_rev = rev; d.up_tag = tag; }
+        if (d.rev === rev && d.rtag === tag) {
+          if (d.up_tag && d.up_tag !== tag && d.up_tag !== (d.pushed_tag || '')) await dropObj(u, d, objName(u, d, d.up_tag));      // a file sent for a version that never got its entry
+          d.up_rev = rev; d.up_tag = tag;
+        }
         upFail.delete(d.id); persist();                           // progress survives the app being closed
       } catch (e) {
         upFailed++; upWhy = errText(e);
@@ -332,19 +399,19 @@ async function syncNow() {
         if (!done) {                                              // another device was first: take its entry, then try once more
           await pullOne(d, u); if (stop()) return;
           if (!d.deleted && upRev && (d.up_rev !== upRev || (d.up_tag || '') !== upTag) && !(upRev === d.pushed_rev && upTag === (d.pushed_tag || ''))) {
-            try { await api('DELETE', '/storage/v1/object/sd/' + objName(u, d, upTag)); } catch (e) {}      // the file this device sent belongs to the version that lost; its pages live on in the copy
+            await dropObj(u, d, objName(u, d, upTag));            // the file this device sent belongs to the version that lost; its pages live on in the copy
           }
           if (entryDue(d)) done = await writeEntry(d, u);
         }
-        if (done && !d.deleted && wasRev && (wasTag !== (d.pushed_tag || '') || wasRev !== d.pushed_rev)) {       // the file of the version before is no longer referenced
-          try { await api('DELETE', '/storage/v1/object/sd/' + objName(u, d, wasTag)); } catch (e) {}
+        if (!d.deleted && wasRev && (wasTag !== (d.pushed_tag || '') || wasRev !== d.pushed_rev)) {       // the file of the version before is no longer referenced (also when the cloud's own row named the new one already)
+          await dropObj(u, d, objName(u, d, wasTag));
         }
       } catch (e) {
         entryFailed++; entryWhy = errText(e);
         if (e instanceof TypeError || navigator.onLine === false || ctl.signal.aborted) break;
       }
     }
-    for (const d of docs) if (d.deleted && !d.cloudPurged && d.srv === d.updated_at) {     // the file of a deleted document goes too; counted as done only when the cloud confirms
+    for (const d of docs) if (d.deleted && !d.cloudPurged && (d.srv === d.updated_at || (!d.srv && !d.pushed_rev))) {     // the files of a deleted document go too; counted as done only when the cloud confirms (a document the cloud never had an entry for: its uploaded file goes right away)
       if (stop()) return;
       try {
         const c = await api('GET', '/rest/v1/sd_documents?select=updated_at,deleted&user_id=eq.' + u + '&id=eq.' + encodeURIComponent(d.id));
@@ -353,16 +420,11 @@ async function syncNow() {
         if (cur && (!cur.deleted || +cur.updated_at !== d.updated_at)) continue;      // the cloud moved on meanwhile: not ours to remove
         let gone = true;
         const names = [objName(u, d, d.pushed_tag || ''), objName(u, d, '')]; if (d.up_tag && d.up_tag !== d.pushed_tag) names.push(objName(u, d, d.up_tag));      // a file this device sent for a version that never got its entry
-        for (const name of names) {
-          if (stop()) return;
-          const r = await api('DELETE', '/storage/v1/object/sd/' + name);
-          let ok = r.ok || r.status === 404;
-          if (!ok && r.status === 400) ok = /not.?found/i.test(await r.text().catch(() => ''));
-          if (!ok) gone = false;
-        }
+        for (const name of names) { if (stop()) return; if (!(await dropObj(u, d, name))) gone = false; }
         if (gone) d.cloudPurged = true;
       } catch (e) {}
     }
+    for (const d of docs) if (d.owed && d.owed.length) for (const name of d.owed.slice()) { if (stop()) return; await dropObj(u, d, name); }      // objects whose removal failed before
     if (stop()) return;
     try { localStorage.setItem(okKey(), String(Date.now())); } catch (e) {}
     if (!(await persist())) throw new Error('The document list could not be saved.');
@@ -416,10 +478,16 @@ async function downloadDoc(d, u) {
   else persist();
   renderAll();
 }
+// The link is requested with a PKCE challenge: it then carries a one-time code that only this
+// browser (holding the verifier) can exchange, so a copy of the address in a history is worthless.
 async function sendMagicLink(email) {
   const redirect = encodeURIComponent(location.origin + location.pathname);
+  const raw = crypto.getRandomValues(new Uint8Array(48)); let verifier = ''; for (const b of raw) verifier += 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~'[b % 66];
+  const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier)));
+  const challenge = btoa(String.fromCharCode.apply(null, digest)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  try { localStorage.setItem(PKCE_KEY, verifier); } catch (e) { return { ok: false, msg: 'This browser blocks local storage; sign-in is not possible here.' }; }
   let r;
-  try { r = await fetch(SYNC.url + '/auth/v1/otp?redirect_to=' + redirect, { method: 'POST', credentials: 'omit', headers: { apikey: SYNC.key, 'Content-Type': 'application/json' }, body: JSON.stringify({ email, create_user: true }) }); }
+  try { r = await fetch(SYNC.url + '/auth/v1/otp?redirect_to=' + redirect, { method: 'POST', credentials: 'omit', headers: { apikey: SYNC.key, 'Content-Type': 'application/json' }, body: JSON.stringify({ email, create_user: true, code_challenge: challenge, code_challenge_method: 's256' }) }); }
   catch (e) { return { ok: false, msg: navigator.onLine === false ? 'No internet connection. Try again when you are online.' : 'The cloud could not be reached. Try again later.' }; }
   if (r.ok) { try { localStorage.setItem(LINK_KEY, String(Date.now())); } catch (e) {} return { ok: true }; }
   let msg = 'Sending failed. Try again later.';

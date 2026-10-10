@@ -154,11 +154,35 @@ Everything is encrypted with AES-256-GCM, all in `vault.js` (WebCrypto, no libra
 
 - Away longer than the chosen time, in front or in the background: locked again. When nothing is
   in flight the page restarts, which also clears the key and every decrypted image from memory.
+- Only work that ends by itself counts as in flight (pages processing, a rotation, a sync, a PDF
+  build, the share sheet or the photo picker in front of the app). A screen that is merely open
+  does not keep the key in memory: with the corners open or the camera running, the restart
+  follows once the work is done, remembers the open document and the corners being adjusted
+  (page, corner positions), and reopens them after the unlock. The restart waits while a PIN is
+  typed or checked, stores the list first and stays on the lock screen, trying again, while that
+  write fails. Under the lock screen Back closes nothing and no message is drawn; a plain message
+  raised meanwhile is shown after the unlock. "Reset this app" erases at the very start of the
+  fresh page, where nothing else can write beside it.
+- A password needs 8 characters with at least 4 letters; anything with fewer letters is a PIN and
+  needs 12 digits, whatever separators it carries, judged on the text the key is derived from.
 - While work is in flight (pages processing, a sync, the share sheet) the lock screen covers the
   app at once instead: open popups and the menu close without acting, everything underneath is
   switched off, and the restart follows as soon as the work is done. Nothing is cut off.
 
 ## One active window
+
+- A window asked to step aside finishes every shot first, however long that takes, and says
+  "busy" once a second meanwhile; the new window waits as long as it hears that and takes over
+  only from a window that stays silent, after asking once more who holds the instance. A window
+  with a lock that has stepped aside restarts without the key: nothing decrypted stays in its
+  memory until "Use Snapdoc here".
+- The database is opened with a version number (2 since v12). A window still running an older
+  release holds the old version open and cannot write beside the new one; the new window says so
+  and starts once that window is closed. Later versions step the old window aside by themselves.
+- A sign-in link opened in the running app is taken off the address at once and handled by a
+  fresh start as soon as nothing is in flight; a link nobody asked for from this browser does not
+  take the app away from another window, and an error link shows only one of a few fixed
+  sentences, never the sender's text.
 
 Only one tab or window is active at a time (Web Locks plus an owner mark that every write checks).
 A second window takes over when the first is in the background, or offers "Use Snapdoc here" when
@@ -202,7 +226,26 @@ The script files share one scope and load in the order above. There is no build 
 - **Both changed the pages** since they last agreed: nothing is overwritten. The device keeps its
   own version as a separate document, "… (copy from this device)", and takes the cloud version.
 - **Pages cannot be added or changed while a newer version is still downloading.** A page that is
-  being scanned at that moment waits and is added to the downloaded version.
+  being scanned at that moment waits and is added to the downloaded version, and counts as a change
+  of the document from that moment. The stamp "these pages are the newest version" is refused at
+  the last moment too: a rotation or crop that was under way when the newer version was announced
+  is not applied, and the user is told. A turned or cropped page is stored under a new id; the
+  list is switched to it and stored before the old record goes, so a save that is lost leaves the
+  old page whole. Undo of a removed page says where the page went when the document changed
+  meanwhile (kept for the newer version, or back as the last page).
+- **Deleting a document** stores the list without its pages first and removes the records
+  afterwards; an interruption leaves only records nothing refers to, and a delete that was
+  interrupted is finished at the next start. The question "delete this document?" describes the
+  document as it is; an answer to a question about one page deletes nothing once more pages are
+  there. A document deleted on another device while the camera or the view is on it: the view and
+  the camera close with the reason; pages that only this device has (being scanned, waiting to
+  join a download) live on in a new document and the camera continues there.
+- **A PDF is built from a snapshot** of the page list, name and page size; a page removed during
+  the build cannot make the file skip another one. If the document changed during the build, the
+  PDF is built again, and two callers for the same version share one build.
+- **The crop that is stored starts from the outline the camera showed**: the full-size photo is
+  searched near that outline, and when nothing is found the outline itself is used, never the
+  whole photo.
 - **Name and deletion** follow the later change. A document deleted on one device and renamed
   later on another comes back whole: the renaming device uploads the file again.
 - The server stamps each write (`synced_at`); devices pull everything stamped after their last
@@ -297,6 +340,9 @@ and do not fork copies.
   of review round 2 (see `REVIEW.md`).
 - v11: the key record is copy-on-write, the key renewal cannot strand a record (see
   "Encryption"); fixes for the vault and storage findings of review round 2.
+- v12: the document view, the camera, the lock screen and the start-up: fixes for the remaining
+  findings of review round 2 (see `REVIEW.md`); database version 2; the stored crop starts from
+  the outline the camera showed; a message never catches a tap meant for what lies under it.
 
 ## Tested, and not yet
 

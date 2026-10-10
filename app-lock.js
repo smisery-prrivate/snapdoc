@@ -4,7 +4,10 @@ let locked = false, softLock = false, unlocking = false, hiddenAt = 0, holdReloa
 const unlockWaiters = [];
 const COVERED = ['home', 'doc', 'edit', 'cam', 'sheet'];
 // shotsPending: the shutter has fired and the photo is not there yet. That shot is work in flight too.
-const workInFlight = () => shotsPending > 0 || selBusy || driveBusy || qLen > 0 || syncing || Date.now() < holdReloadUntil || current() === 'edit' || (current() === 'cam' && camCount > 0) || edApplying || pdfBuilding;
+// Only work that ends by itself counts: a screen that is merely open (the corners, the camera) is
+// restored after the restart instead (see restartLocked). busyN covers the queue, a rotation, the
+// corners being opened or applied and a PDF build.
+const workInFlight = () => shotsPending > 0 || selBusy || driveBusy || qLen > 0 || syncing || Date.now() < holdReloadUntil || pickerOpen || edApplying || pdfBuilding || busyN > 0;
 
 // ---------- lock screen ----------
 // soft = shown over a running app because work is still in flight; the page restarts (and the key
@@ -22,7 +25,7 @@ function showLock(soft) {
   $('lockText').textContent = pin ? 'Enter your ' + (num ? 'PIN' : 'password') + ' to open your scans.' : 'Unlock with your fingerprint or screen lock.';
   if (pin) setTimeout(() => inp.focus(), 100); else if (!document.hidden) setTimeout(tryUnlock, 300);
   clearInterval(softTimer);
-  if (soft) softTimer = setInterval(() => { if (!locked || !softLock) { clearInterval(softTimer); return; } if (!workInFlight()) { clearInterval(softTimer); restartLocked(); } }, 1500);
+  if (soft) softTimer = setInterval(() => { if (!locked || !softLock) { clearInterval(softTimer); return; } if (!workInFlight() && !unlocking && !$('pinInput').value) restartLocked(true); }, 1500);      // not while a PIN is typed or checked
 }
 let unlockCtl = null, unlockRun = null, unlockSeq = 0;
 async function tryUnlock() {
@@ -42,6 +45,7 @@ async function tryUnlock() {
     for (const id of COVERED) $(id).inert = false;
     $('lock').hidden = true; $('pinInput').value = ''; $('lockErr').textContent = '';
     while (unlockWaiters.length) unlockWaiters.shift()();
+    if (heldToast) { const m = heldToast; heldToast = ''; toast(m); }
     resumeCam(); syncNow(); resealAll();
   } catch (e) {
     if (my === unlockSeq) $('lockErr').textContent = e && (e.name === 'NotAllowedError' || e.name === 'AbortError') ? 'Not unlocked. Tap Unlock to try again.' : (e && e.message) || 'Not unlocked.';
@@ -53,9 +57,12 @@ $('pinInput').addEventListener('keydown', e => { if (e.key === 'Enter') tryUnloc
 $('lockReset').addEventListener('click', () => popup('Reset Snapdoc on this device?',
   'Everything stored here is erased: scans, lock and sign-in. Scans that were synced come back after you sign in and enter your encryption password again. Scans that were never synced are lost.',
   [{ label: 'Erase and reset', cls: 'danger', fn: () => wipeEverything().then(() => location.reload()) }, { label: 'Cancel', cls: 'quiet' }], { lockOk: true }));
-async function wipeEverything() {
+// The erase itself happens at the very start of the fresh page (boot), where nothing else can write
+// a record under the old key beside it.
+async function wipeEverything() { try { sessionStorage.setItem(WIPE_KEY, '1'); } catch (e) {} }
+async function wipeNow() {
   await idb.wipe();
-  try { for (const k of Object.keys(localStorage)) if (k.startsWith('snapdoc.')) localStorage.removeItem(k); sessionStorage.removeItem(RESUME_KEY); } catch (e) {}
+  try { for (const k of Object.keys(localStorage)) if (k.startsWith('snapdoc.')) localStorage.removeItem(k); sessionStorage.removeItem(RESUME_KEY); sessionStorage.removeItem(EDIT_KEY); } catch (e) {}
 }
 // Lock again. Work in flight is never cut off: the lock screen covers the app at once and the page
 // restarts when that work is done. A restart also clears the key and every decrypted image from memory.
@@ -64,11 +71,39 @@ function relock() {
   if (workInFlight()) { showLock(true); return; }
   restartLocked();
 }
-async function restartLocked() {
-  try { sessionStorage.setItem(RESUME_KEY, curDoc ? curDoc.id : ''); } catch (e) {}
-  if (current() === 'doc') commitName();
-  try { await waitForPages(); await persistChain; } catch (e) {}
-  location.reload();
+// soft: the lock screen is up and the user may unlock meanwhile; then the key stays and nothing restarts.
+// The restart waits for the work that ends by itself, stores the list (and stays on the lock screen,
+// trying again, while that fails), remembers the open document and the corners being adjusted,
+// and only then reloads. From the decision on, no new shot starts.
+let restarting = false, linkHash = '';
+async function restartLocked(soft) {
+  if (restarting) return; restarting = true;
+  try {
+    while (shotsPending > 0 || qLen > 0) { await waitForPages(); if (shotsPending > 0) await new Promise(r => setTimeout(r, 100)); }
+    if (soft && (!locked || unlocking || $('pinInput').value)) { restarting = false; return; }
+    const resume = curDoc || (camDoc && camDoc.pages.length ? camDoc : null);
+    try { sessionStorage.setItem(RESUME_KEY, resume ? resume.id : ''); } catch (e) {}
+    if (ed) try { sessionStorage.setItem(EDIT_KEY, JSON.stringify({ doc: ed.doc.id, page: ed.page.id, quad: ed.quad, filter: ed.filter, rot: ed.rot })); } catch (e) {}
+    if (current() === 'doc') commitName();
+    if (stack.includes('cam')) { try { stopCamera(); } catch (e) {} }
+    await waitForPages();
+    if (!(await persist())) {                                     // the list could not be stored: no restart on an unsaved state
+      if (locked) $('lockErr').textContent = 'Your last changes could not be saved. Trying again…';
+      restarting = false; setTimeout(() => restartLocked(soft), 5000); return;
+    }
+    if (soft && (!locked || unlocking)) { restarting = false; return; }
+    reloadPage();
+  } catch (e) { restarting = false; }
+}
+// a sign-in link that is waiting goes back onto the address, so that the fresh start reads it
+function reloadPage() { if (linkHash) { try { history.replaceState(history.state, '', location.pathname + location.search + linkHash); } catch (e) {} } location.reload(); }
+// A sign-in link (or Google's answer) opened in the running app: taken off the address at once and
+// handled by a fresh start as soon as nothing is in flight, through the same careful path as a lock.
+function linkOpened() {
+  linkHash = location.hash; try { history.replaceState(histState(), '', location.pathname + location.search); } catch (e) {}
+  if (passive) return;
+  const go = () => { if (restarting) return; if (workInFlight()) { setTimeout(go, 1000); return; } restartLocked(false); };
+  go();
 }
 document.addEventListener('visibilitychange', () => {
   clearTimeout(hideTimer);
@@ -78,7 +113,8 @@ document.addEventListener('visibilitychange', () => {
     return;
   }
   const away = hiddenAt ? Date.now() - hiddenAt : 0; hiddenAt = 0;
-  if (passive) return;
+  if (passive || restarting) return;
+  if (pickerOpen) setTimeout(() => { pickerOpen = false; }, 3000);      // back without a choice (a browser without the cancel event): the hold ends
   if (Vault.lockType() && !locked && away > (settings.lockAfter || 60) * 1000) relock();
   if (locked) { if (Vault.lockType() !== 'pin' && !unlocking) tryUnlock(); return; }
   if (!Vault.isOpen()) return;
@@ -120,9 +156,12 @@ const LOCK_TEXT = {
   pin: ['🔒 Locked with a PIN or password', 'The key to your scans is derived from it.']
 };
 // A short PIN can be tried out by a computer against a copy of the stored data, so it is not offered.
+// Judged on the text the key is derived from (NFKC-normalised, counted in characters): a secret with
+// fewer than four letters is a PIN, whatever separators it carries, and needs 12 characters.
 function pinProblem(a) {
-  if (/^\d+$/.test(a)) return a.length < 12 ? 'A PIN needs 12 digits or more. Shorter ones can be guessed by a computer. A password of 8 or more characters with letters works too.' : '';
-  return a.length < 8 ? 'Use at least 8 characters, or a PIN of 12 digits or more.' : '';
+  const s = String(a).normalize('NFKC'), n = [...s].length, letters = (s.match(/\p{L}/gu) || []).length, digits = (s.match(/\p{Nd}/gu) || []).length;
+  if (letters < 4) return digits < 12 ? 'A PIN needs 12 digits or more. Shorter ones can be guessed by a computer. A password of 8 or more characters with at least 4 letters works too.' : '';
+  return n < 8 ? 'Use at least 8 characters with at least 4 letters, or a PIN of 12 digits or more.' : '';
 }
 function renderLockBox() {
   const box = $('lockBox'); if (!box) return;
@@ -140,7 +179,7 @@ function renderLockBox() {
     return;
   }
   if (pinStep) {
-    box.innerHTML = '<p>Choose a password (8 characters or more) or a long PIN (12 digits or more). It is asked every time the app opens. It cannot be recovered: if you forget it, the app on this device has to be reset.</p>' +
+    box.innerHTML = '<p>Choose a password (8 characters or more, with at least 4 letters) or a long PIN (12 digits or more). It is asked every time the app opens. It cannot be recovered: if you forget it, the app on this device has to be reset.</p>' +
       '<div class="pinform"><input id="pin1" type="password" autocomplete="new-password" placeholder="Password or long PIN"><input id="pin2" type="password" autocomplete="new-password" placeholder="Repeat"></div>' +
       '<button class="btn primary" id="pinSave">Turn the lock on</button><button class="btn quiet" id="pinBack">Back</button><div class="hint" id="lockHint"></div>';
     $('pinBack').addEventListener('click', () => { pinStep = false; renderLockBox(); });
@@ -161,9 +200,10 @@ function renderLockBox() {
   let setting = false;
   $('lockOnBio').addEventListener('click', async () => {
     const hint = $('lockHint'); if (setting) return;
-    if (!(await Vault.biometricAvailable())) { hint.textContent = 'This device or browser offers no fingerprint or screen lock here. Use a password or long PIN instead.'; return; }
-    setting = true; hint.textContent = 'Confirm with your fingerprint or screen lock. Your phone may ask twice.';
+    setting = true;                                               // before the first wait: a second tap starts nothing
     try {
+      if (!(await Vault.biometricAvailable())) { hint.textContent = 'This device or browser offers no fingerprint or screen lock here. Use a password or long PIN instead.'; return; }
+      hint.textContent = 'Confirm with your fingerprint or screen lock. Your phone may ask twice.';
       const t = await Vault.setBiometric();
       toast(t === 'gate' ? 'Lock is on. On this browser it guards the screen only.' : 'Lock is on'); renderLockBox(); resealAll();
     } catch (e) { hint.textContent = e && e.name === 'NotAllowedError' ? 'Not set up: it was cancelled. Tap again to retry.' : 'Not set up: ' + errText(e); }

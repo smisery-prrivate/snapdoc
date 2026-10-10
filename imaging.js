@@ -1288,7 +1288,12 @@
       try { bmp = await createImageBitmap(m.blob, { imageOrientation: 'from-image' }); } catch (e) { bmp = await createImageBitmap(m.blob); }   // older browsers reject the option
       const src = IMG.drawCapped(bmp, m.maxOrig || 2400); if (bmp.close) bmp.close();
       let quad = m.quad;
-      if (!quad) { const det = IMG.detectQuad(src); quad = det ? IMG.insetQuad(det.quad, 0.012) : IMG.fullQuad(src.width, src.height); }
+      if (!quad) {                                        // m.hint: the outline the camera showed (in the live picture's pixels): the search starts from it and falls back to it
+        let hint = null;
+        if (m.hint && Array.isArray(m.hint.quad) && m.hint.w > 0 && m.hint.h > 0) { const kx = src.width / m.hint.w, ky = src.height / m.hint.h; hint = m.hint.quad.map(p => [p[0] * kx, p[1] * ky]); }
+        let det = null; try { det = IMG.detectQuad(src, { prior: hint || undefined }); } catch (e) {}
+        quad = det ? IMG.insetQuad(det.quad, 0.012) : hint ? IMG.insetQuad(hint, 0.012) : IMG.fullQuad(src.width, src.height);
+      }
       let out = dress(IMG.warp(src, quad, { maxSide: m.maxOut || 2000 }), m.filter);
       if (m.rot) out = IMG.rotate(out, m.rot);
       const r = await derive(out);

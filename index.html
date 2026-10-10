@@ -194,6 +194,7 @@
   #away .btn { width: 100%; max-width: 320px; height: 56px; border: none; border-radius: 16px; background: var(--accent); color: #fff; font-size: 17px; font-weight: 700; }
   #toast { position: fixed; left: 50%; bottom: calc(env(safe-area-inset-bottom) + 130px); transform: translateX(-50%); z-index: 50; background: rgba(30,28,25,.92); color: #fff; padding: 12px 16px; border-radius: 14px; font-size: 15px; display: none; align-items: center; gap: 14px; max-width: 92vw; }
   #toast.show { display: flex; }
+  #toast { pointer-events: none; } #toast button { pointer-events: auto; }      /* a message never catches a tap meant for what lies under it */
   #toast button { height: 36px; padding: 0 12px; border: none; border-radius: 10px; background: #fff; color: #000; font-weight: 700; font-size: 14px; }
   .busybar { position: fixed; top: 0; left: 0; right: 0; height: 3px; background: var(--accent); z-index: 60; transform-origin: left; animation: busy 1.2s ease-in-out infinite; display: none; }
   .busybar.on { display: block; }

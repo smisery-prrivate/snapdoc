@@ -230,7 +230,7 @@ const Vault = (() => {
   async function setPin(pin) {
     need(LK);
     const salt = rand(16), k = await pbkdfKey(pin, salt, PBKDF_ITER);
-    await enableKeyLock({ type: 'pin', salt: b64(salt), iter: PBKDF_ITER, numeric: /^\d+$/.test(pin) }, k, 'sd|lk|pin');
+    await enableKeyLock({ type: 'pin', salt: b64(salt), iter: PBKDF_ITER, numeric: /^\p{Nd}+$/u.test(String(pin).normalize('NFKC')) }, k, 'sd|lk|pin');
   }
   // Under a gate lock the device slot exists and stays as it is: the key file is not touched, the
   // record changes in one write. Under a key lock a new slot is written first; the stored record

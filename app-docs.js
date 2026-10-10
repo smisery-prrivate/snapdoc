@@ -93,7 +93,8 @@ $('selShare').addEventListener('click', () => selAction(true));
 $('selDelete').addEventListener('click', () => {
   const list = [...selected].map(byId).filter(d => d && !d.deleted); if (!list.length) return;
   popup(list.length === 1 ? 'Delete this document?' : 'Delete ' + list.length + ' documents?', 'All their pages and PDFs are removed' + (SYNC && session ? ' here and in the cloud' : '') + '.', [
-    { label: 'Delete', cls: 'danger', fn: async () => { for (const d of list) d.deleted = true; save(); for (const d of list) await purgeDocData(d); persist(); setSelectMode(false); renderAll(); toast(list.length === 1 ? 'Document deleted' : list.length + ' documents deleted'); } },
+    // the lists are detached and stored first, then the records go: an interruption leaves only records nothing refers to
+    { label: 'Delete', cls: 'danger', fn: async () => { const gone = list.map(d => { const g = d.pages; d.pages = []; d.deleted = true; return g; }); save(); setSelectMode(false); renderAll(); toast(list.length === 1 ? 'Document deleted' : list.length + ' documents deleted'); } },
     { label: 'Keep', cls: 'quiet' }]);
 });
 $('selSave').addEventListener('click', () => selAction(false));
@@ -199,10 +200,36 @@ async function fixCrop(d, p) {
   openEdit(p, d);
 }
 function confirmDeleteDoc(d, title) {
-  popup(title || 'Delete this document?', 'All ' + d.pages.length + (d.pages.length === 1 ? ' page' : ' pages') + ' and the PDF are removed' + (SYNC && session ? ' here and in the cloud' : '') + '.', [
-    // the change is recorded before the first wait, so a sync running at the same moment cannot swallow it
-    { label: 'Delete', cls: 'danger', fn: async () => { d.deleted = true; save(); await purgeDocData(d); persist(); if (curDoc === d && current() === 'doc') back(); renderAll(); toast('Document deleted'); } },
+  settleToast();                                                   // a page still waiting for Undo is settled before the question is asked
+  const n = d.pages.length, rev = d.rev;
+  popup(title || 'Delete this document?', 'All ' + n + (n === 1 ? ' page' : ' pages') + ' and the PDF are removed' + (SYNC && session ? ' here and in the cloud' : '') + '.', [
+    // the change is recorded before the first wait, so a sync running at the same moment cannot swallow it;
+    // the page list is detached and stored first, then the records go: an interruption leaves only records nothing refers to
+    { label: 'Delete', cls: 'danger', fn: async () => {
+      if (d.deleted || d.pages.length !== n || d.rev !== rev) { toast('The document changed meanwhile. Nothing was deleted.'); return; }
+      const gone = d.pages; d.pages = []; d.deleted = true; save();
+      if (curDoc === d && stack.includes('doc') && !navPending) { navPending++; history.go(-(stack.length - stack.indexOf('doc'))); }      // the camera on top of it goes too
+      renderAll(); toast('Document deleted');
+      await persistChain; await purgeDocData(d, gone); persist();
+    } },
     { label: 'Keep', cls: 'quiet' }]);
+}
+// The new picture of a page is stored under a new id, the list is switched to it and stored, and
+// only then is the old record removed: a save that is lost leaves the old page whole. false: the
+// document changed meanwhile (a newer version arrived, the page or the document is gone); nothing is stamped.
+async function replacePage(d, p, r, orig, meta) {
+  if (d.deleted || !d.pages.includes(p) || !hasContent(d)) return false;
+  const nid = uid();
+  await pagePut(nid, d.id, { jpeg: r.jpeg, prev: r.prev, orig, meta });
+  const i = d.pages.indexOf(p);
+  if (d.deleted || i < 0 || !hasContent(d)) { idb.del('pages', nid).catch(() => {}); return false; }
+  const np = Object.assign({}, p, { id: nid, w: r.w, h: r.h, size: r.jpeg.size }); if (orig) np.o = 1; else delete np.o;
+  d.pages[i] = np; p.next = np; if (selPage === p.id) selPage = nid;
+  if (!touchContent(d)) { d.pages[i] = p; delete p.next; idb.del('pages', nid).catch(() => {}); return false; }
+  const stored = await save();
+  dropPrev(p.id); dropQuick(p.id);
+  if (stored) idb.del('pages', p.id).catch(() => {});             // otherwise the old record stays until the sweep finds it unreferenced
+  return true;
 }
 let rotChain = Promise.resolve();
 async function pageAction(a, p) {
@@ -213,6 +240,7 @@ async function pageAction(a, p) {
   else if (a === 'rot') {
     busy(true);
     rotChain = rotChain.then(async () => {        // one after the other: two quick taps turn the page twice
+      while (p.next) p = p.next;                    // the turn before stored the page under a new id
       if (curDoc !== d || d.pages.indexOf(p) < 0 || !hasContent(d)) return;
       try {
         const rec = await pageGet(p.id, ['orig']); if (!rec) throw new Error('page data is missing');
@@ -221,15 +249,13 @@ async function pageAction(a, p) {
           const rot = ((rec.rot || 0) + 90) % 360;
           const look = lookOf(rec.filter);
           r = await task({ cmd: 'process', blob: rec.orig, quad: rec.quad, filter: look, rot, keepOrig: false, maxOrig: 2800, maxOut: 2400 });
-          meta = { w: r.w, h: r.h, rot, filter: look, thumb: r.thumb };
+          meta = { quad: rec.quad, w: r.w, h: r.h, origW: rec.origW, origH: rec.origH, rot, filter: look, thumb: r.thumb };
         } else {
           const j = await pageGet(p.id, ['jpeg']);
           r = await task({ cmd: 'rotate', blob: j.jpeg, deg: 90 }); meta = { w: r.w, h: r.h, thumb: r.thumb };
         }
-        if (d.deleted || d.pages.indexOf(p) < 0) return;
-        await pagePut(p.id, d.id, { jpeg: r.jpeg, prev: r.prev, meta });
-        Object.assign(p, { w: r.w, h: r.h, size: r.jpeg.size }); dropPrev(p.id); dropQuick(p.id);
-        touchContent(d); save(); if (curDoc === d) renderDoc();
+        if (!(await replacePage(d, p, r, rec.orig || null, meta))) { if (curDoc === d) toast('The document changed meanwhile. The page was not turned.'); return; }
+        if (curDoc === d) renderDoc();
       } catch (e) { toast('Rotate failed: ' + errText(e)); }
     }).then(() => busy(false));
     await rotChain;
@@ -238,19 +264,23 @@ async function pageAction(a, p) {
   else if (a === 'del') {
     if (d.pages.length <= 1) { confirmDeleteDoc(d, 'This is the only page. Delete the document?'); return; }
     d.pages.splice(i, 1); selPage = null; pendingDel.add(p.id); touchContent(d); save(); renderDoc(); renderHome();
+    const tag = d.rtag;                                             // the version the page was removed from
     let settled = false;
     const drop = () => { pendingDel.delete(p.id); idb.del('pages', p.id).catch(() => {}); dropPrev(p.id); };
     toast('Page removed', { label: 'Undo',
-      fn: () => {
+      fn: () => {                                                   // the page goes back into whatever the document has become, and says so when that is not its old place
         if (settled) return; settled = true;
-        if (d.deleted || !docs.includes(d) || !hasContent(d)) { drop(); return; }
-        pendingDel.delete(p.id); d.pages.splice(Math.min(i, d.pages.length), 0, p); touchContent(d); save(); renderAll();
+        if (d.deleted || !docs.includes(d)) { drop(); toast('The page could not be restored: the document was deleted.'); return; }
+        pendingDel.delete(p.id);
+        if (!hasContent(d)) { p.local = 1; d.pages.push(p); save({ sync: false }); renderAll(); toast('The document was changed on another device. The page is added to the newer version once it is here.'); return; }
+        if (d.rtag !== tag) { d.pages.push(p); touchContent(d); save(); renderAll(); toast('The document was changed meanwhile. The page is back as the last page.'); return; }
+        d.pages.splice(Math.min(i, d.pages.length), 0, p); touchContent(d); save(); renderAll();
       },
       expire: () => { if (settled) return; settled = true; drop(); } });
   }
 }
 $('addBtn').addEventListener('click', () => {
-  const d = curDoc; if (!d) return;
+  const d = curDoc; if (!d || d.deleted) return;
   if (!hasContent(d)) { toast(STILL_DOWNLOADING); return; }
   openCamera(d);
 });
@@ -265,22 +295,36 @@ $('docMore').addEventListener('click', () => {
 });
 
 // ---------- PDF ----------
+// The PDF of the document as it is now. Built from a snapshot of the page list, name and page
+// size: a page removed or moved while the pages are read cannot make the file skip another one.
+// If the document changed during the build, the result is not cached and the PDF is built again.
+// Two callers for the same version share one build.
+const pdfSig = d => d.rev_have + '|' + settings.pageSize + '|' + (d.name || '').trim();
+const pdfJobs = new Map();
 async function getPdf(d) {
   await waitForPages();
-  const sig = d.rev_have + '|' + settings.pageSize + '|' + (d.name || '').trim();
-  const c = await pdfGet(d.id, sig).catch(() => null);
-  if (c) return c.blob;
-  const pages = [];
-  for (const p of d.pages) {
-    if (p.status) continue;
-    const rec = await pageGet(p.id, ['jpeg']);
-    if (!rec || !rec.jpeg) throw new Error('a page of this document is missing on this device');   // never build (or upload) a PDF with pages left out
-    pages.push({ blob: rec.jpeg, w: rec.w, h: rec.h });
-  }
-  if (!pages.length) throw new Error('no pages');
-  const r = await task({ cmd: 'pdf', pages, title: (d.name || '').trim() || dateStamp(d.created_at), pageSize: settings.pageSize });
-  try { await pdfPut(d.id, sig, r.pdf); } catch (e) {}                // the cache is a convenience; the PDF is returned either way
-  return r.pdf;
+  const sig = pdfSig(d), key = d.id + '|' + sig;
+  if (pdfJobs.has(key)) return pdfJobs.get(key);
+  const job = (async () => {
+    const c = await pdfGet(d.id, sig).catch(() => null);
+    if (c) return c.blob;
+    const list = d.pages.filter(p => !p.status), title = (d.name || '').trim() || dateStamp(d.created_at), pageSize = settings.pageSize;
+    const pages = [];
+    for (const p of list) {
+      const rec = await pageGet(p.id, ['jpeg']);
+      if (!rec || !rec.jpeg) throw new Error('a page of this document is missing on this device');   // never build (or upload) a PDF with pages left out
+      pages.push({ blob: rec.jpeg, w: rec.w, h: rec.h });
+    }
+    if (!pages.length) throw new Error('no pages');
+    const r = await task({ cmd: 'pdf', pages, title, pageSize });
+    const now = d.pages.filter(p => !p.status);
+    if (pdfSig(d) !== sig || now.length !== list.length || now.some((p, i) => p !== list[i])) return null;      // changed meanwhile: not this version's PDF
+    try { await pdfPut(d.id, sig, r.pdf); } catch (e) {}              // the cache is a convenience; the PDF is returned either way
+    return r.pdf;
+  })();
+  pdfJobs.set(key, job);
+  let out; try { out = await job; } finally { pdfJobs.delete(key); }
+  return out || getPdf(d);
 }
 const pdfTimers = new Map(); let pdfChain = Promise.resolve();
 function schedulePdf(d) {            // built ahead so Share opens at once and the upload has its file; one document at a time
@@ -289,7 +333,7 @@ function schedulePdf(d) {            // built ahead so Share opens at once and t
     pdfTimers.delete(d.id);
     pdfChain = pdfChain.then(async () => {
       const cur = byId(d.id); if (!cur || cur.deleted || !cur.pages.length || cur.rev_have !== cur.rev || !Vault.isOpen() || passive) return;
-      try { await getPdf(cur); scheduleSync(); } catch (e) {}
+      try { if (!(await pdfHas(cur.id, pdfSig(cur)))) await getPdf(cur); scheduleSync(); } catch (e) {}      // a build that is up already is not decrypted for nothing
     });
   }, 1500));
 }
@@ -339,14 +383,14 @@ async function openEdit(p, d) {
     const here = current() === from && ((from === 'doc' && curDoc === d) || (from === 'cam' && camDoc === d));
     if (!here || !d.pages.includes(p) || d.deleted || p.status || locked || passive) return;     // left meanwhile
     const full = IMG.fullQuad(srcCanvas.width, srcCanvas.height);
-    ed = { doc: d, page: p, hasOrig, blob, srcCanvas, step: 'crop', warped: null, scale: 1,
+    ed = { doc: d, page: p, hasOrig, blob, srcCanvas, step: 'crop', warped: null, scale: 1, origW: rec.origW, origH: rec.origH,
       quad: (hasOrig && Array.isArray(rec.quad) ? rec.quad : full).map(c => c.slice()),
       filter: hasOrig ? lookOf(rec.filter) : 'photo', rot: hasOrig ? (rec.rot || 0) : 0 };
     ed.start = JSON.stringify([ed.quad, ed.filter, ed.rot]);
     push('edit'); renderEdit();
   } catch (e) { toast('Could not open the page: ' + errText(e)); } finally { edOpening = false; busy(false); }
 }
-function editCleanup() { ed = null; dragIdx = -1; camAfterEdit(); }
+function editCleanup() { const d = ed && ed.doc; ed = null; dragIdx = -1; camAfterEdit(); if (d && !d.deleted && !hasContent(d)) syncNow(); }      // a download stood back while the corners were open
 function renderEdit() {
   if (!ed) return;
   const crop = ed.step === 'crop';
@@ -426,17 +470,15 @@ $('editNext').addEventListener('click', async () => {
   if (ed.step === 'crop' && LOOKS) { ed.step = 'filter'; ed.warped = null; renderEdit(); return; }
   const e0 = ed, d = e0.doc;
   if (!d || JSON.stringify([e0.quad, e0.filter, e0.rot]) === e0.start) { back(); return; }
-  if (!hasContent(d)) { toast(STILL_DOWNLOADING); return; }
+  if (!hasContent(d)) { toast('This document was changed on another device. The crop was not applied; the new version is loading.'); back(); syncNow(); return; }      // the download waits for the corners to close
   edApplying = true; busy(true); $('editNext').disabled = true;
   try {
     const r = await task({ cmd: 'process', blob: e0.blob, quad: e0.quad, filter: e0.filter, rot: e0.rot, keepOrig: false, maxOrig: 2800, maxOut: 2400 });
-    if (d.deleted || !d.pages.includes(e0.page) || !hasContent(d)) throw new Error('the document changed meanwhile');
     const meta = { w: r.w, h: r.h, thumb: r.thumb };
-    if (e0.hasOrig) Object.assign(meta, { quad: e0.quad, filter: e0.filter, rot: e0.rot });
-    await pagePut(e0.page.id, d.id, { jpeg: r.jpeg, prev: r.prev, meta });
-    Object.assign(e0.page, { w: r.w, h: r.h, size: r.jpeg.size }); dropPrev(e0.page.id); dropQuick(e0.page.id);
-    touchContent(d); save();
-    if (camDoc === d && d.pages[d.pages.length - 1] === e0.page) $('doneThumb').src = r.thumb;      // the camera's Done button shows this page
+    if (e0.hasOrig) Object.assign(meta, { quad: e0.quad, filter: e0.filter, rot: e0.rot, origW: e0.origW, origH: e0.origH });
+    const wasLast = camDoc === d && d.pages[d.pages.length - 1] === e0.page;
+    if (!(await replacePage(d, e0.page, r, e0.hasOrig ? e0.blob : null, meta))) throw new Error('the document changed meanwhile');
+    if (wasLast) $('doneThumb').src = r.thumb;      // the camera's Done button shows this page
     if (ed === e0) back(); else if (curDoc === d && current() === 'doc') renderDoc();      // left the editor meanwhile: stay where the user is
   } catch (e) { toast('Could not apply: ' + errText(e)); } finally { edApplying = false; busy(false); $('editNext').disabled = false; }
 });

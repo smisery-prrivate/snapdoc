@@ -209,16 +209,37 @@ async function applyRow(row) {
   if (upd > d.updated_at) {                                       // name and deletion: the later change wins
     if (!del) { d.name = String(m.name || ''); d.created_at = +m.created_at || d.created_at; }
     d.deleted = del; d.updated_at = upd; d.srv = upd;
-    if (del && !wasDeleted) { await purgeDocData(d); if (curDoc === d && current() === 'doc') { toast('This document was deleted on another device.'); back(); } }
+    if (del && !wasDeleted) await deletedElsewhere(d);
   } else if (upd === d.updated_at) d.srv = upd;
   else if (del && !d.deleted) {                                   // our later change keeps the document, but the other device removed the file
     if (d.pages.some(p => !p.status)) {                           // the pages here are the only ones left: they are the newest version and go up again
       if (d.rev_have !== d.rev) { d.rev = Math.max(Date.now(), d.rev + 1); d.rtag = newTag(); d.rev_have = d.rev; d.pageCount = d.pages.filter(p => !p.status).length; }
       d.pushed_rev = 0; d.pushed_tag = ''; d.up_rev = 0; d.up_tag = ''; d.srv = -1;
-    } else { d.deleted = true; d.updated_at = upd; d.srv = upd; await purgeDocData(d); if (curDoc === d && current() === 'doc') { toast('This document was deleted on another device.'); back(); } }
+    } else { d.deleted = true; d.updated_at = upd; d.srv = upd; await deletedElsewhere(d); }
   } else { d.srv = -1; if (d.deleted) d.cloudPurged = false; }    // the cloud holds an older entry than ours (a late write replaced it): send ours again
   if (snap[id] === before) snap[id] = sigOf(d);                   // a local change that is not saved yet is never swallowed
   return 'ok';
+}
+// A delete from another device is applied here. Pages that only this device has (being scanned
+// right now, or waiting to join a download) are never thrown away: they live on in a new document,
+// the camera continues there, and the user is told. The view of the deleted document closes.
+async function deletedElsewhere(d) {
+  const keep = d.pages.filter(p => p.status || p.local), gone = d.pages.filter(p => !p.status && !p.local), wasCam = camDoc === d;
+  d.pages = [];
+  let n = null;
+  if (keep.length) {
+    const now = Date.now();
+    n = migrate({ id: uid(), name: '', created_at: now, updated_at: now, srv: 0, pages: keep.map(p => { const q = Object.assign({}, p); delete q.local; return q; }), rev: now, rtag: newTag(), rev_have: now, pushed_rev: 0, up_rev: 0, deleted: false });
+    docs.unshift(n); snap[n.id] = sigOf(n); touchContent(n);
+    if (camDoc === d) { camDoc = n; camFromDoc = false; camCount = keep.length; }
+  } else if (camDoc === d) camDoc = null;                         // the next shot starts a new document
+  const onIt = curDoc === d && stack.includes('doc'), onCam = camDoc === n && n && stack.includes('cam');
+  if (onIt) {
+    if (n) { curDoc = n; if (current() === 'doc') renderDoc(); }
+    else if (!navPending) { navPending++; history.go(-(stack.length - stack.indexOf('doc'))); }
+  }
+  if (onIt || wasCam) toast(n ? 'This document was deleted on another device. The pages scanned here are kept in a new document.' : wasCam && !onIt ? 'This document was deleted on another device. New pages go into a new document.' : 'This document was deleted on another device.');
+  await purgeDocData(d, gone);
 }
 const sealedMeta = d => Vault.csealJson(d.deleted ? { del: true, u: d.updated_at }
   : { name: d.name, pages: d.pages.filter(p => !p.status && !p.local).length || d.pageCount || 0, size: d.size || 0, created_at: d.created_at, rev: d.up_rev || 0, tag: d.up_tag || '', u: d.updated_at, del: false }, 'sd|meta|' + d.id);

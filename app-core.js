@@ -2,7 +2,7 @@
 /* Snapdoc core: helpers, settings, encrypted storage, the document model, the processing
    queue, screens and the back button. The app is several plain script files that share one
    scope (no build step); index.html loads them in order. */
-const VERSION = 'v11';
+const VERSION = 'v12';
 const $ = id => document.getElementById(id);
 const IMG = self.SnapdocImaging;
 const CFG = self.APP_CONFIG || {};
@@ -49,9 +49,13 @@ const idb = (() => {
   const STORES = ['pages', 'pdfs', 'meta', 'thumbs'];
   let dbp = null;
   const open = () => dbp || (dbp = new Promise((res, rej) => {
-    const r = indexedDB.open('snapdoc', 1);
+    // version 2 since v12: a window still running an older release holds version 1 open and cannot
+    // write beside this one; it is told to close. Later versions step this window aside instead.
+    const r = indexedDB.open('snapdoc', 2);
     r.onupgradeneeded = () => { const d = r.result; for (const s of STORES) if (!d.objectStoreNames.contains(s)) d.createObjectStore(s, { keyPath: 'id' }); };
-    r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error);
+    r.onblocked = () => { try { fatal('An older Snapdoc window is still open. Close it, then open Snapdoc again.'); } catch (e) {} };
+    r.onsuccess = () => { const db = r.result; db.onversionchange = () => { try { db.close(); } catch (e) {} dbp = null; try { instanceLost(); } catch (e) {} }; res(db); };
+    r.onerror = () => rej(r.error);
   }));
   const txOpts = (store, mode) => mode === 'readwrite' && store === 'meta' ? { durability: 'strict' } : undefined;      // the key record and the list are on disk before the next step relies on them
   const fail = (t, e) => t.error || (e && e.target && e.target.error) || new Error('storage request failed');       // a refused request reports its own error before the transaction has one
@@ -120,6 +124,10 @@ async function pdfPut(id, sig, blob) {
 }
 // returns the cached PDF only when it was built for exactly this signature; the large file is
 // decrypted only then
+// true when the cached PDF was built for exactly this signature; nothing large is decrypted
+async function pdfHas(id, want) {
+  try { const r = await idb.get('pdfs', id); return !!r && new TextDecoder().decode(await Vault.open(r.s, 'sd|pdf|' + id + '|s')) === want; } catch (e) { return false; }
+}
 async function pdfGet(id, want) {
   const r = await idb.get('pdfs', id); if (!r) return null;
   const sig = new TextDecoder().decode(await Vault.open(r.s, 'sd|pdf|' + id + '|s'));
@@ -254,12 +262,16 @@ function persist() {
   }).catch(e => { persistQueued = false; persistFailed = true; if (!passive) toast('Saving failed: ' + errText(e)); return false; });
   return persistChain;
 }
+// a delete marker older than 60 days goes only when nothing is owed to the cloud any more: the
+// marker sent in its current form and the file removal confirmed, or the document never reached a cloud
+const settledTombstone = d => (d.cloudPurged && d.srv === d.updated_at) || (!d.srv && !d.pushed_rev && !d.row_rev);
 function save(opts) {
   const now = Date.now();
   for (const d of docs) { const s = sigOf(d); if (snap[d.id] !== s) { d.updated_at = Math.max(now, d.updated_at + 1); snap[d.id] = s; } }
-  docs = docs.filter(d => !(d.deleted && now - d.updated_at > 60 * 864e5));
-  persist();
+  docs = docs.filter(d => !(d.deleted && now - d.updated_at > 60 * 864e5 && settledTombstone(d)));
+  const stored = persist();
   if (!opts || opts.sync !== false) { scheduleSync(); scheduleDrive(); }
+  return stored;
 }
 const alive = () => docs.filter(d => !d.deleted).sort((a, b) => b.created_at - a.created_at);
 const byId = id => docs.find(d => d.id === id);
@@ -271,10 +283,14 @@ function newDoc() {
 }
 // The pages changed: new revision, new thumbnail, PDF rebuilt in the background. Only ever called
 // for a document whose newest pages are on this device (callers check hasContent first).
+// The pages of this document are a new version made here. Refused (false) while a newer version
+// from the cloud is still on its way: older pages are never stamped as the newest version.
 function touchContent(d) {
+  if (!hasContent(d)) return false;
   d.rev = Math.max(Date.now(), d.rev + 1); d.rev_have = d.rev; d.rtag = newTag();
   d.size = d.pages.reduce((a, p) => a + (p.size || 0), 0); d.pageCount = d.pages.filter(p => !p.status).length;
   refreshThumb(d); schedulePdf(d);
+  return true;
 }
 async function refreshThumb(d) {
   const p = d.pages.find(x => !x.status); let t = '';
@@ -284,8 +300,10 @@ async function refreshThumb(d) {
   renderHome();
 }
 const fileName = d => ((d.name || '').trim().replace(/[\\/:*?"<>|\u0000-\u001f]/g, '-') || dateStamp(d.created_at)) + '.pdf';
-async function purgeDocData(d) {
-  for (const p of d.pages) await idb.del('pages', p.id).catch(() => {});
+// pages: the page list to remove (by default the document's own); callers that detached the list
+// before storing it hand it over here
+async function purgeDocData(d, pages) {
+  for (const p of pages || d.pages) await idb.del('pages', p.id).catch(() => {});
   await idb.del('pdfs', d.id).catch(() => {}); await idb.del('thumbs', d.id).catch(() => {});
   thumbCache.delete(d.id); d.pages = [];
 }
@@ -324,7 +342,10 @@ function current() { return stack.slice().reverse().find(s => BASE.includes(s)) 
 const histState = () => ({ n: stack.length, b: BOOT_ID });
 function push(name) { stack.push(name); history.pushState(histState(), ''); applyStack(); }
 function replaceTop(name) { leave(stack.pop()); stack.push(name); history.replaceState(histState(), ''); applyStack(); }
-function back() { if (stack.length > 1) history.back(); }
+// navPending: a step back has been asked for and its popstate has not arrived yet
+let navPending = 0;
+const lockTop = () => { const t = stack[stack.length - 1]; return t === 'popup' || t === 'sheet'; };      // under the lock screen only its own popup (and the menu) may close
+function back() { if (locked && !lockTop()) return; if (stack.length > 1) { navPending++; history.back(); } }
 function leave(name) {
   if (name === 'cam') {                 // the system back button out of a new batch scan still ends on the new document and its name
     const d = camDoc, n = camCount, fromDoc = camFromDoc;
@@ -337,8 +358,9 @@ function leave(name) {
   if (name === 'popup') { const p = popupState; popupState = null; if (p && p.after) setTimeout(p.after, 0); }   // the chosen action runs once the popup has really closed
 }
 window.addEventListener('popstate', e => {
-  const st = e.state;
-  if (/[#&](access_token|error|error_code)=/.test(location.hash)) { location.reload(); return; }   // a sign-in link was opened in this very tab: start over so it is handled
+  const st = e.state; navPending = 0;
+  if (/[#&](access_token|error|error_code)=/.test(location.hash)) { linkOpened(); return; }   // a sign-in link was opened in this very tab: handled by a fresh start once nothing is in flight
+  if (locked && !lockTop()) { history.pushState(histState(), ''); return; }                    // Back under the lock screen closes nothing
   if (!st || st.b !== BOOT_ID) {        // an entry from before a restart: Back still closes exactly one level
     if (stack.length > 1) { leave(stack.pop()); history.replaceState(histState(), ''); applyStack(); renderAll(); }
     else history.back();
@@ -366,8 +388,11 @@ function popup(title, text, buttons, opts) {
   popupState = { after: null, lockOk }; push('popup');
 }
 $('popup').addEventListener('click', e => { if (e.target === $('popup')) back(); });
-let toastTimer = null, toastAction = null;
+let toastTimer = null, toastAction = null, heldToast = '';
+// a pending Undo (or similar) is settled now, before something else changes the document
+function settleToast() { const t = $('toast'); clearTimeout(toastTimer); t.classList.remove('show'); const a = toastAction; toastAction = null; if (a && a.expire) a.expire(); }
 function toast(msg, action) {
+  if (locked) { if (action) { if (action.expire) action.expire(); return; } heldToast = msg; return; }      // nothing is drawn over the lock screen; a plain message waits for the unlock
   const t = $('toast'); clearTimeout(toastTimer);
   if (toastAction && toastAction.expire) toastAction.expire();
   toastAction = action || null;

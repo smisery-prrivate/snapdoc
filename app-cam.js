@@ -11,6 +11,10 @@ let peekShot = null, peekSeq = 0; const shots = new Map();      // shots: page i
 // to an earlier opening must not act on the one that is on screen now, even for the same document.
 // lastShot: the newest shot of this opening. shotsPending: shots (of any opening) whose photo has not arrived yet.
 let camSess = 0, lastShot = null, shotsPending = 0;
+// storedThumb: the picture of the last page of this opening that is really stored (the Done button
+// falls back to it when a later shot fails). autoFails: failed captures in a row with Auto on; after
+// two the sheet is left to the shutter button. pickerOpen: the photo picker is in front of the app.
+let storedThumb = '', autoFails = 0, autoStuck = false, pickerOpen = false;
 
 function updateCamUI() {
   $('modeSingle').classList.toggle('on', !settings.batch); $('modeBatch').classList.toggle('on', settings.batch);
@@ -25,8 +29,9 @@ async function keepAwake() {
   try { wakeLock = await navigator.wakeLock.request('screen'); wakeLock.addEventListener('release', () => { wakeLock = null; }); } catch (e) { wakeLock = null; }
 }
 async function openCamera(doc) {
+  if (doc && (doc.deleted || !docs.includes(doc))) return;      // a document that is gone takes no pages
   if (doc && !hasContent(doc)) { toast(STILL_DOWNLOADING); return; }
-  camDoc = doc || null; camFromDoc = !!doc; camCount = 0; shooting = false; camSess++; lastShot = null;
+  camDoc = doc || null; camFromDoc = !!doc; camCount = 0; shooting = false; camSess++; lastShot = null; storedThumb = ''; autoFails = 0; autoStuck = false;
   lastQuad = null; liveQuad = null; autoHold = null; holdSig = null; holdUntil = 0; anchorQuad = null; readyFrac = 0;
   $('doneThumb').hidden = true; $('camMsg').hidden = true; $('shutter').disabled = false; setHint(''); hidePeek();
   push('cam'); updateCamUI();
@@ -155,8 +160,8 @@ function onDetection(det, v, now) {
         const sg = holdSig ? pageSig(v, full) : null;
         if (sg && sigDiff(sg, holdSig) > 12) { if (!sigMissSince) sigMissSince = now; else if (now - sigMissSince > 450) autoHold = null; } else sigMissSince = 0;      // another page lies there now
       }
-      anchorQuad = null; hint = settings.batch ? 'Captured · next page' : '';
-    } else if (!full) { anchorQuad = null; hint = 'Looking for a document'; }
+      anchorQuad = null; hint = autoStuck ? 'Not captured · tap the shutter to try again' : settings.batch ? 'Captured · next page' : '';
+    } else if (!full) { anchorQuad = null; autoStuck = false; hint = 'Looking for a document'; }
     else {
       if (!anchorQuad || quadDist(full, anchorQuad) > 0.03 * diag) { anchorQuad = full; stableSince = now; }      // moved: the clock starts again
       readyFrac = Math.min(1, (now - stableSince) / 900);
@@ -260,19 +265,29 @@ function killShot(shot) {
   shot.dead = true; if (peekShot === shot) hidePeek();
   if (shot.quick && !shot.attached) { shot.attached = true; URL.revokeObjectURL(shot.quick.url); }
 }
+// A capture failed (no photo, or the page could not be processed or stored). With Auto on the
+// sheet still lies there: it is taken again once it holds still, but after two failures in a row it
+// is left to the shutter button, so a page that cannot be processed does not loop.
+function captureFailed() {
+  if (current() !== 'cam' || !settings.auto) return;
+  autoFails++; autoHold = null; holdSig = null; holdUntil = 0; anchorQuad = null; readyFrac = 0;
+  if (autoFails >= 2) { autoStuck = true; holdUntil = performance.now() + 3000; setHint('Not captured · tap the shutter to try again'); }
+  else setHint('Not captured · hold still again');
+}
 async function shoot() {
   const v = $('video');
-  if (shooting || !stream || locked || passive || !v.videoWidth) return;      // no picture in the viewfinder yet: nothing to take
-  shooting = true; shotsPending++;
+  if (shooting || !stream || locked || passive || restarting || !v.videoWidth) return;      // no picture in the viewfinder yet: nothing to take
+  shooting = true; shotsPending++; autoStuck = false;
   const d0 = camDoc, sess = camSess, quad0 = settings.auto ? lastQuad : null;  // lastQuad is kept up to date only while Auto is on
   autoHold = quad0; holdSig = quad0 ? pageSig(v, quad0) : null; holdUntil = quad0 ? 0 : performance.now() + 3000; holdMissSince = 0; sigMissSince = 0; anchorQuad = null; readyFrac = 0;
   const fx = $('flashFx'); fx.classList.remove('on'); void fx.offsetWidth; fx.classList.add('on');
-  const thumb = quickThumb(v, quad0 || liveQuad);
-  const shot = lastShot = { sess, gen: camGen, label: 'Page ' + ((d0 ? d0.pages.length : 0) + 1), quick: null, pageId: null, doc: null, counted: false, shown: false, dead: false, done: false, attached: false, fixing: false };
-  quickPreview(v, quad0 || liveQuad).then(r => shotQuickReady(shot, r));
+  const outline = quad0 || liveQuad, thumb = quickThumb(v, outline);
+  const shot = lastShot = { sess, gen: camGen, label: 'Page ' + ((d0 ? d0.pages.length : 0) + 1), quick: null, pageId: null, doc: null, counted: false, shown: false, dead: false, done: false, attached: false, fixing: false,
+    hint: outline ? { quad: outline.map(p => p.slice()), w: v.videoWidth, h: v.videoHeight } : null };      // the outline the camera showed: the stored crop starts from it
+  quickPreview(v, outline).then(r => shotQuickReady(shot, r));
   let blob = null; try { blob = await takePhotoBlob(); } catch (e) {}
   shotsPending--; if (sess === camSess) shooting = false;                      // a later opening of the camera has its own shutter
-  if (!blob) { killShot(shot); if (sess === camSess && current() === 'cam') toast('Could not take the photo.'); return; }
+  if (!blob) { killShot(shot); if (sess === camSess && current() === 'cam') { toast('Could not take the photo.'); captureFailed(); } return; }
   // Done, X or Back was pressed while the photo was being taken, or the camera was even opened again:
   // the photo belongs to the document it was shot for, not to whatever the camera shows now
   if (sess !== camSess || current() !== 'cam' || camDoc !== d0) { lateCapture(blob, d0, shot); return; }
@@ -291,6 +306,7 @@ function lateCapture(blob, d0, shot) {
 }
 // A capture becomes a placeholder page at once; the worker fills it in.
 function addCapture(blob, thumb, stay, shot) {
+  if (camDoc && camDoc.deleted) { camDoc = newDoc(); camFromDoc = false; camCount = 0; storedThumb = ''; $('doneThumb').hidden = true; toast('This document was deleted on another device. New pages go into a new document.'); }
   if (!camDoc) camDoc = newDoc();
   else if (!docs.includes(camDoc)) { docs.unshift(camDoc); snap[camDoc.id] = sigOf(camDoc); }      // dropped after a failed first page: take it back
   const d = camDoc, pageId = uid();
@@ -304,35 +320,48 @@ function addCapture(blob, thumb, stay, shot) {
 }
 function finishCamera() {
   const d = camDoc;
-  if (camFromDoc || !d || !docs.includes(d)) { back(); return; }
+  if (camFromDoc || !d || !docs.includes(d) || d.deleted) { back(); return; }
   stopCamera(); openDoc(d, { replace: true, fresh: true });      // straight to the pages, cursor in the name
 }
+// the view of a document that is not in the list any more closes, whatever lies on top of it
 function dropEmptyDoc(d) {
   const i = docs.indexOf(d); if (i >= 0) docs.splice(i, 1); delete snap[d.id];
-  if (curDoc === d && current() === 'doc') back();
+  if (curDoc === d && stack.includes('doc') && !navPending) { navPending++; history.go(-(stack.length - stack.indexOf('doc'))); }
 }
-async function processNew(d, pageId, blob) {
+// d0: the document the page was captured for. If a delete from another device moved the page into
+// a new document meanwhile, the page is finished there.
+async function processNew(d0, pageId, blob) {
   const look = lookOf(settings.filter);
+  const owner = () => docs.find(x => !x.deleted && x.pages.some(p => p.id === pageId)) || (d0.pages.some(p => p.id === pageId) ? d0 : null);
   const forget = () => { const s = shots.get(pageId); shots.delete(pageId); if (s) killShot(s); dropQuick(pageId); pageSettled(pageId); return s; };
   const fail = () => {                                // nothing half-done stays behind, whatever step failed
+    const d = owner() || d0;
     const i = d.pages.findIndex(x => x.id === pageId); if (i >= 0) d.pages.splice(i, 1);
     const s = forget();
     idb.del('pages', pageId).catch(() => {});
-    if (d === camDoc && s && s.counted && s.sess === camSess) { camCount = Math.max(0, camCount - 1); updateCamUI(); }      // only a page this opening of the camera counted
+    if (d === camDoc && s && s.counted && s.sess === camSess) {      // only a page this opening of the camera counted
+      camCount = Math.max(0, camCount - 1); updateCamUI();
+      if (storedThumb) $('doneThumb').src = storedThumb; else $('doneThumb').hidden = true;      // the button shows a page that is really there
+      captureFailed();
+    }
     if (!d.pages.length && !d.rev && d !== camDoc) dropEmptyDoc(d);
     save({ sync: false }); renderAll();
   };
+  const s0 = shots.get(pageId), hint = s0 && s0.hint ? s0.hint : null;
   let r;
-  try { r = await task({ cmd: 'process', blob, filter: look, keepOrig: true, maxOrig: 2800, maxOut: 2400 }); }
+  try { r = await task({ cmd: 'process', blob, hint, filter: look, keepOrig: true, maxOrig: 2800, maxOut: 2400 }); }
   catch (e) { fail(); throw e; }
-  const p = d.pages.find(x => x.id === pageId);
+  let d = owner(), p = d && d.pages.find(x => x.id === pageId);
   if (!p || d.deleted) { forget(); return; }                    // removed while it was processing
   try { await pagePut(pageId, d.id, { jpeg: r.jpeg, prev: r.prev, orig: r.orig, meta: { quad: r.quad, w: r.w, h: r.h, origW: r.origW, origH: r.origH, filter: look, rot: 0, thumb: r.thumb } }); }
   catch (e) { fail(); throw e; }
+  d = owner(); p = d && d.pages.find(x => x.id === pageId);
+  if (!p || d.deleted) { idb.del('pages', pageId).catch(() => {}); forget(); return; }      // deleted while the page was stored: nothing stays behind
   Object.assign(p, { w: r.w, h: r.h, size: r.jpeg.size, o: 1 }); delete p.status;
   if (!docs.includes(d) && !d.deleted) { docs.unshift(d); snap[d.id] = sigOf(d); }
+  if (d === camDoc) { storedThumb = r.thumb; autoFails = 0; }
   if (hasContent(d)) { touchContent(d); save(); }
-  else { p.local = 1; save({ sync: false }); syncNow(); }        // a newer version is still downloading: this page is added to it once it is here
+  else { p.local = 1; d.updated_at = Math.max(Date.now(), d.updated_at + 1); save({ sync: false }); syncNow(); }        // a newer version is still downloading: this page is added to it once it is here; it counts as a change of this document
   const shot = shots.get(pageId); shots.delete(pageId); if (shot) shot.done = true;
   renderAll(); showFinished(d, r, shot); pageSettled(pageId);
   setTimeout(() => dropQuick(pageId), 2500);                    // by then the finished picture stands where the quick one stood
@@ -405,7 +434,7 @@ function camAfterEdit() {
 }
 $('camPeekFix').addEventListener('click', peekFix);
 $('camPeekImg').addEventListener('click', () => { const s = peekShot; if (!s || !s.fixing) hidePeek(); });      // a tap on the picture puts it away
-function pickPhotos() { holdReloadUntil = Date.now() + 600000; $('importInput').click(); }   // the picker hides the app; do not restart it on return
+function pickPhotos() { pickerOpen = true; $('importInput').click(); }   // the picker hides the app; it is not restarted while the picker is in front
 $('shutter').addEventListener('click', shoot);
 $('camClose').addEventListener('click', () => { if (camCount && !camFromDoc) finishCamera(); else back(); });
 $('done').addEventListener('click', finishCamera);
@@ -418,10 +447,10 @@ $('torchBtn').addEventListener('click', async () => {
   $('torchBtn').style.opacity = torchOn ? 1 : .6;
 });
 $('gallery').addEventListener('click', pickPhotos);
-$('importInput').addEventListener('cancel', () => { holdReloadUntil = 0; });
+$('importInput').addEventListener('cancel', () => { pickerOpen = false; });
 $('importInput').addEventListener('change', e => {
   const files = Array.from(e.target.files || []).filter(f => /^image\//.test(f.type) || /\.(jpe?g|png|webp)$/i.test(f.name));
-  e.target.value = ''; holdReloadUntil = 0;
+  e.target.value = ''; pickerOpen = false;
   if (!files.length || current() !== 'cam' || passive) return;
   for (const f of files) addCapture(f, null, true);
   finishCamera();

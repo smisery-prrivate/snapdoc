@@ -358,18 +358,21 @@ async function syncNow() {
     if (stop()) return;
     if (maxSeen > cursor) { cursors[u] = maxSeen; if (!(await persist())) { cursors[u] = cursor; throw new Error('The document list could not be saved.'); } }   // the bookmark moves only with the list
     let upFailed = 0, upWhy = '';
+    const needsUp = d => !(d.deleted || d.rev_have !== d.rev || !d.pages.length || d.pages.some(p => p.status || p.local)) && !(d.rev === d.up_rev && (d.rtag || '') === (d.up_tag || ''));
+    const upTotal = docs.filter(needsUp).length; let upDone = 0;  // the status line counts them down, with a percentage
     for (const d of docs.slice()) {                               // upload the files of versions made here; one failing document does not hold up the rest
       if (stop()) return;
       if (d.deleted || d.rev_have !== d.rev || !d.pages.length || d.pages.some(p => p.status || p.local)) continue;
       if (!d.rtag) d.rtag = newTag();
       if (d.rev === d.up_rev && d.rtag === (d.up_tag || '')) continue;
+      upDone++;
       const f = upFail.get(d.id);
       if (f && f.rev === d.rev && f.tag === d.rtag && Date.now() < f.until) { upFailed++; upWhy = f.why; continue; }      // refused before: tried again later, not on every pass
       const rev = d.rev, tag = d.rtag;
       try {
         if ((d.size || 0) + 4096 > MAX_FILE) throw new Error('"' + docLabel(d) + '" is larger than 50 MB and cannot be synced. Split it into smaller documents.');
         if (!(await ensureSession())) return;
-        setSyncState('busy', 'Uploading ' + docLabel(d));
+        setSyncState('busy', progressMsg('Uploading', upDone, upTotal, d));
         const pdf = await getPdf(d);
         if (stop()) return;
         if (d.rev !== rev || d.rtag !== tag) continue;            // changed while the PDF was built: next pass
@@ -437,10 +440,13 @@ async function syncNow() {
     if (!(await persist())) throw new Error('The document list could not be saved.');
     renderAll();
     let failed = 0, why = '';
+    const needsDown = d => !(d.deleted || hasContent(d) || d.pushed_rev < d.rev);
+    const downTotal = docs.filter(needsDown).length; let downDone = 0;
     for (const d of docs.slice()) {                               // download what is newer in the cloud
       if (stop()) return;
-      if (d.deleted || hasContent(d) || d.pushed_rev < d.rev) continue;
-      try { if (!(await ensureSession())) return; await downloadDoc(d, u); } catch (e) { failed++; why = errText(e); }
+      if (!needsDown(d)) continue;
+      downDone++;
+      try { if (!(await ensureSession())) return; await downloadDoc(d, u, progressMsg('Downloading', downDone, downTotal, d)); } catch (e) { failed++; why = errText(e); }
     }
     if (unreadable) throw new Error(unreadable + (unreadable === 1 ? ' entry' : ' entries') + ' in the cloud cannot be opened with the key on this device.');
     if (upFailed) throw new Error(upFailed === 1 ? upWhy : upFailed + ' documents could not be uploaded. Last reason: ' + upWhy);
@@ -451,9 +457,11 @@ async function syncNow() {
     if (session && !passive && !ctl.signal.aborted) setSyncState(navigator.onLine === false ? 'offline' : 'error', errText(e));
   } finally { syncing = false; if (syncCtl === ctl) syncCtl = null; if (syncAgain) { syncAgain = false; scheduleSync(); } afterNav(); }
 }
-async function downloadDoc(d, u) {
+// "Downloading 3 of 12 · 25% · name": the first sync on a new device shows how far it is
+const progressMsg = (verb, i, n, d) => n > 1 ? verb + ' ' + i + ' of ' + n + ' · ' + Math.round((i - 1) / n * 100) + '% · ' + docLabel(d) : verb + ' ' + docLabel(d);
+async function downloadDoc(d, u, msg) {
   if (ed && ed.doc === d) return;                                 // being edited right now: next round
-  setSyncState('busy', 'Downloading ' + docLabel(d));
+  setSyncState('busy', msg || 'Downloading ' + docLabel(d));
   const rev = d.rev, tag = d.rtag || '';
   let r = await api('GET', '/storage/v1/object/authenticated/sd/' + objName(u, d, tag));
   if (r.status === 404 && tag) r = await api('GET', '/storage/v1/object/authenticated/sd/' + objName(u, d, ''));      // written before version 4 of the format

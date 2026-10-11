@@ -390,6 +390,8 @@ and do not fork copies.
 - v12: the document view, the camera, the lock screen and the start-up: fixes for the remaining
   findings of review round 2 (see `REVIEW.md`); database version 2; the stored crop starts from
   the outline the camera showed; a message never catches a tap meant for what lies under it.
+- v15: the sync status line counts uploads and downloads with a percentage ("Downloading 3 of 12 ·
+  25%"), so the first sync on a new device shows how far it is.
 - v14: fixes for the 17 findings of the regression check on v13 (see `REVIEW.md`); the sequence
   stamp is part of `supabase-schema.sql`, which is safe to run again.
 - v13: fixes for all 87 findings of review round 3 (see `REVIEW.md`): sync (fresh file names on

@@ -188,6 +188,7 @@ async function boot() {
     return;
   }
   if (state === 'locked') { showLock(false); await whenUnlocked(); if (!isOwner()) { instanceLost(); return; } }
+  else if (!Vault.lockType() && !tokens && !driveQp) { await offerLock(); if (!isOwner()) { instanceLost(); return; } }      // no lock yet: asked before anything is scanned, and at every start until one is set (a link that is being handled goes first)
   try { await loadDocs(); } catch (e) { fatal('The stored documents could not be read (' + errText(e) + ').'); return; }
   await loadSession(); syncFormatCheck(); await loadDrive(); await loadFolder();
   let driveMsgBoot = ''; if (driveQp) { try { driveMsgBoot = await driveAdopt(driveQp); } catch (e) { driveMsgBoot = 'Google Drive was not connected: ' + errText(e); } }

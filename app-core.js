@@ -3,7 +3,7 @@ if (self !== top) { try { document.documentElement.hidden = true; } catch (e) {}
 /* Snapdoc core: helpers, settings, encrypted storage, the document model, the processing
    queue, screens and the back button. The app is several plain script files that share one
    scope (no build step); index.html loads them in order. */
-const VERSION = 'v16';
+const VERSION = 'v17';
 const $ = id => document.getElementById(id);
 const IMG = self.SnapdocImaging;
 const CFG = self.APP_CONFIG || {};
@@ -43,10 +43,10 @@ function writeGuard() {
 // step when a page is edited.
 const LOOKS = false;
 const lookOf = f => LOOKS ? (f || 'color') : 'photo';
-let settings = { filter: 'photo', pageSize: 'A4', lockAfter: 60, batch: false, auto: true };
-const LOCK_AFTER = [5, 60, 300, 1800];
+let settings = { filter: 'photo', pageSize: 'A4', lockAfter: 0, batch: false, auto: true };      // lockAfter: 0 = lock as soon as the app leaves the screen (installs from before v17 keep their stored value)
+const LOCK_AFTER = [0, 5, 60, 300, 1800];
 try { Object.assign(settings, JSON.parse(localStorage.getItem(SET_KEY) || '{}')); } catch (e) {}
-if (!LOCK_AFTER.includes(+settings.lockAfter)) settings.lockAfter = 60;      // only the offered values: nothing in plain storage can switch the lock off
+if (!LOCK_AFTER.includes(+settings.lockAfter)) settings.lockAfter = 0;       // only the offered values: nothing in plain storage can lengthen the delay beyond what the menu offers
 if (!LOOKS) settings.filter = 'photo';              // also for an install that had a look stored from an earlier version
 const saveSettings = () => { try { localStorage.setItem(SET_KEY, JSON.stringify(settings)); } catch (e) {} };
 

@@ -35,7 +35,11 @@ first). Working name, visible in `index.html`, `manifest.json` and `VERSION` in 
   file. `⋯` also offers save, rename and delete.
 - **Sync.** Optional. Sign in by e-mail link, choose an encryption password once, and every
   document appears on every device that signs in and knows the password.
-- **Lock.** Optional. Fingerprint or screen lock, or a password or long PIN.
+- **Lock.** Asked for at the first start, before the first scan (since v17): fingerprint or screen
+  lock first, a password or long PIN as the other way; "Not now" asks again at the next start, and an
+  install from before v17 without a lock is asked at its next start too. New installs lock as soon as
+  the app leaves the screen (the photo picker does not count as leaving); the delay can be
+  lengthened in the menu.
 - **Google Drive copies.** Optional (`app-drive.js`, needs `googleClientId` in `config.js`). Once
   a Google account is connected in the menu, every document is kept as a plain PDF in a folder
   "Snapdoc" of that account: uploaded from the device right after a scan, renamed and replaced
@@ -156,7 +160,7 @@ Everything is encrypted with AES-256-GCM, all in `vault.js` (WebCrypto, no libra
 
 ## The lock screen
 
-- Away longer than the chosen time, in front or in the background: locked again. When nothing is
+- Away longer than the chosen time (new installs: at once), in front or in the background: locked again. When nothing is
   in flight the page restarts, which also clears the key and every decrypted image from memory.
 - Only work that ends by itself counts as in flight (pages processing, a rotation, a sync, a PDF
   build, a queued list write, the share sheet or the photo picker in front of the app). When the
@@ -407,6 +411,9 @@ and do not fork copies.
 - v12: the document view, the camera, the lock screen and the start-up: fixes for the remaining
   findings of review round 2 (see `REVIEW.md`); database version 2; the stored crop starts from
   the outline the camera showed; a message never catches a tap meant for what lies under it.
+- v17: the lock is set up at the first start, before the first scan; new installs lock as soon as
+  the app leaves the screen; a browser that can only guard the screen says so at once and offers the
+  password or PIN that ties the key.
 - v16: PDF copies in a folder of the PC (for a sync app such as Proton Drive), and the scheduled
   backup of the Google Drive PDFs into Proton Drive (see above).
 - v15: the sync status line counts uploads and downloads with a percentage ("Downloading 3 of 12 ·

@@ -519,6 +519,8 @@ function lastOkLabel() {
 }
 function renderSyncLine() {
   const el = $('syncline'); el.className = 'subline';
+  if (folder && folderState === 'reconnect' && folderPending().length) { el.className = 'subline err'; el.textContent = 'PDF copies need a tap · tap here'; return; }
+  if (folder && folderState === 'error') { el.className = 'subline err'; el.textContent = '⚠ PDF copies: ' + folderMsg; return; }
   if (drive && driveState === 'reconnect' && drivePending().length) { el.className = 'subline err'; el.textContent = 'Google Drive needs a tap to reconnect · tap here'; return; }
   if (!SYNC) { el.textContent = 'Encrypted on this device'; return; }
   if (!session) { el.textContent = 'Encrypted on this device · tap to add cloud sync'; return; }
@@ -532,7 +534,7 @@ function renderSyncLine() {
   if (syncState === 'busy') { el.textContent = '↻ ' + syncMsg + '…'; return; }
   el.textContent = +localStorage.getItem(okKey()) ? '✓ Encrypted sync on · last synced ' + lastOkLabel() : 'Connecting to the cloud…';
 }
-$('syncline').addEventListener('click', () => openSheet());
+$('syncline').addEventListener('click', () => { if (folder && folderState === 'reconnect' && folderPending().length) { folderTap(); return; } openSheet(); });      // the browser's folder question needs the tap itself
 function renderSyncBox() {
   const box = $('syncBox'); if (!box) return;
   const hasKey = !!session && Vault.hasCloudKey(session.uid);

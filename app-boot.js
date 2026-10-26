@@ -189,7 +189,7 @@ async function boot() {
   }
   if (state === 'locked') { showLock(false); await whenUnlocked(); if (!isOwner()) { instanceLost(); return; } }
   try { await loadDocs(); } catch (e) { fatal('The stored documents could not be read (' + errText(e) + ').'); return; }
-  await loadSession(); syncFormatCheck(); await loadDrive();
+  await loadSession(); syncFormatCheck(); await loadDrive(); await loadFolder();
   let driveMsgBoot = ''; if (driveQp) { try { driveMsgBoot = await driveAdopt(driveQp); } catch (e) { driveMsgBoot = 'Google Drive was not connected: ' + errText(e); } }
   if (tokens) { try { linkMsg = await adoptLink(tokens); } catch (e) { linkMsg = 'The sign-in link could not be used.'; } }
 
@@ -218,7 +218,7 @@ async function boot() {
   }
 
   if (session) syncNow().then(() => { if (tokens && !linkMsg && (keyNeed === 'create' || keyNeed === 'enter')) openSheet(); });
-  scheduleDrive(driveQp ? 0 : 4000);
+  scheduleDrive(driveQp ? 0 : 4000); scheduleFolder(4000);
   setTimeout(resealAll, 3000); setTimeout(housekeeping, 8000);
   registerSW();
 }
@@ -262,5 +262,5 @@ setInterval(() => { if (passive) return; renderSyncLine(); syncNow(); }, 60000);
 
 window.snapdocDebug = { get docs() { return docs; }, get session() { return session; }, get keyNeed() { return keyNeed; }, get syncState() { return syncState + (syncMsg ? ': ' + syncMsg : ''); },
   get busy() { return syncing || qLen > 0 || persistQueued; }, get qLen() { return qLen; }, get passive() { return passive; }, get locked() { return locked; }, get updateReady() { return updateReady; },
-  syncNow, syncRetry, getPdf, idb, pageGet, Vault, relock, resealAll, housekeeping, get drive() { return drive; }, get driveState() { return driveState; }, driveNow, drivePending };
+  syncNow, syncRetry, getPdf, idb, pageGet, Vault, relock, resealAll, housekeeping, get drive() { return drive; }, get driveState() { return driveState; }, driveNow, drivePending, folderNow, folderPending, loadFolder, get folderBusy() { return folderBusy; }, get folderState() { return folderState; } };
 boot().catch(e => fatal('Unexpected error: ' + errText(e)));

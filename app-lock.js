@@ -7,7 +7,7 @@ const COVERED = ['home', 'doc', 'edit', 'cam', 'sheet'];
 // Only work that ends by itself counts: a screen that is merely open (the corners, the camera) is
 // restored after the restart instead (see restartLocked). busyN covers the queue, a rotation, the
 // corners being opened or applied and a PDF build.
-const workInFlight = () => shotsPending > 0 || selBusy || driveBusy || qLen > 0 || syncing || persistQueued || Date.now() < holdReloadUntil || pickerOpen || edApplying || pdfBuilding || busyN > 0;
+const workInFlight = () => shotsPending > 0 || selBusy || driveBusy || folderBusy || qLen > 0 || syncing || persistQueued || Date.now() < holdReloadUntil || pickerOpen || edApplying || pdfBuilding || busyN > 0;
 
 // ---------- lock screen ----------
 // soft = shown over a running app because work is still in flight; the page restarts (and the key
@@ -151,6 +151,7 @@ function renderInstallBox() {
 function renderSheet() {
   if (!stack.includes('sheet')) return;
   $('panel').innerHTML = '<div class="grab"></div><h2>Cloud sync</h2><div id="syncBox"></div><h2>App lock</h2><div id="lockBox"></div>' +
+    '<h2>PDF copies in a folder</h2><div id="folderBox"></div>' +
     '<h2>Google Drive</h2><div id="driveBox"></div>' +
     '<h2>Scanning</h2>' +
     (LOOKS ? '<div class="rowopt"><span>Default look</span><select id="setFilter"><option value="color">Color</option><option value="gray">Gray</option><option value="bw">Black &amp; white</option><option value="photo">Photo (no filter)</option></select></div>' : '') +
@@ -158,7 +159,7 @@ function renderSheet() {
     '<h2>App</h2><div id="installBox"></div>' +
     '<div class="hint">Scans are encrypted on this device and encrypted again before they are uploaded. No cookies, no trackers, no third-party scripts.</div>' +
     '<div class="version">Snapdoc · ' + VERSION + '</div>';
-  renderSyncBox(); renderDriveBox(); renderLockBox(); renderInstallBox();
+  renderSyncBox(); renderFolderBox(); renderDriveBox(); renderLockBox(); renderInstallBox();
   if (LOOKS) { $('setFilter').value = settings.filter; $('setFilter').addEventListener('change', e => { settings.filter = e.target.value; saveSettings(); }); }
   $('setPage').value = settings.pageSize; $('setPage').addEventListener('change', e => { settings.pageSize = e.target.value; saveSettings(); });
 }

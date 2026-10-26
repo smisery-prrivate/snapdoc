@@ -3,7 +3,7 @@ if (self !== top) { try { document.documentElement.hidden = true; } catch (e) {}
 /* Snapdoc core: helpers, settings, encrypted storage, the document model, the processing
    queue, screens and the back button. The app is several plain script files that share one
    scope (no build step); index.html loads them in order. */
-const VERSION = 'v15';
+const VERSION = 'v16';
 const $ = id => document.getElementById(id);
 const IMG = self.SnapdocImaging;
 const CFG = self.APP_CONFIG || {};
@@ -292,7 +292,7 @@ function save(opts) {
   for (const d of docs) { const s = sigOf(d); if (snap[d.id] !== s) { d.updated_at = Math.max(now, d.updated_at + 1); snap[d.id] = s; } }
   docs = docs.filter(d => !(d.deleted && now - d.updated_at > 60 * 864e5 && settledTombstone(d)));
   const stored = persist();
-  if (!opts || opts.sync !== false) { scheduleSync(); scheduleDrive(); }
+  if (!opts || opts.sync !== false) { scheduleSync(); scheduleDrive(); scheduleFolder(); }
   return stored;
 }
 const alive = () => docs.filter(d => !d.deleted).sort((a, b) => b.created_at - a.created_at);
